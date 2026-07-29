@@ -52,6 +52,8 @@ MQTT_PORT = env_int("MQTT_PORT", 1883)
 MQTT_USERNAME = env("MQTT_USERNAME")
 MQTT_PASSWORD = env("MQTT_PASSWORD")
 MQTT_TOPIC_PREFIX = env("MQTT_TOPIC_PREFIX", "energy/solar").rstrip("/")
+# How long to allow for the broker connection before warning, then re-warning, about it.
+MQTT_WARN_AFTER = env_int("MQTT_WARN_AFTER", 60)
 # Comma-separated register names to publish (e.g. "total_active_power,run_state"). Empty/unset
 # publishes everything.
 MQTT_PUBLISH_FIELDS = {f.strip() for f in env("MQTT_PUBLISH_FIELDS", "").split(",") if f.strip()}
@@ -563,6 +565,30 @@ def mqtt_connect():
     return client
 
 
+def mqtt_watchdog_loop(mqtt_client):
+    """Warns while the broker is unreachable.
+
+    paho's connect_async retries silently forever, so without this a blocked port or wrong host is
+    indistinguishable from a healthy connection -- nothing is logged either way.
+    """
+    warned = False
+    while True:
+        time.sleep(MQTT_WARN_AFTER)
+        if mqtt_client.is_connected():
+            warned = False
+            continue
+        if not warned:
+            log.warning(
+                "Still not connected to MQTT at %s:%s after %ss. Solar values are not being "
+                "published and no smart-meter data is arriving. Check the broker is reachable "
+                "from this container (firewall/routing) and that the credentials are right.",
+                MQTT_HOST,
+                MQTT_PORT,
+                MQTT_WARN_AFTER,
+            )
+            warned = True
+
+
 def influx_writer_loop():
     """Drains _write_queue, keeping blocking HTTP off the MQTT network thread."""
     while True:
@@ -692,6 +718,7 @@ def main():
     modbus_client = ModbusTcpClient(INVERTER_HOST, port=INVERTER_PORT, timeout=10)
     mqtt_client = mqtt_connect()
 
+    threading.Thread(target=mqtt_watchdog_loop, args=(mqtt_client,), daemon=True).start()
     threading.Thread(target=influx_writer_loop, daemon=True).start()
     threading.Thread(target=pvoutput_loop, daemon=True).start()
     threading.Thread(target=mindergas_loop, daemon=True).start()
