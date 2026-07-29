@@ -12,8 +12,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Required for `load: true` to export the built image into the local docker daemon.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # load: true puts the image into the local daemon so the smoke test can run it.
       - name: Build Docker image (no push)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
+          load: true
+          tags: energy-monitor:pr
+
+      # Building proves nothing about runtime: a dependency bump that renames a pymodbus argument
+      # or changes register decoding still builds cleanly and only fails when the container first
+      # talks to hardware. This polls a fake inverter through the real code path instead.
+      - name: Smoke test
+        run: |
+          docker run --rm \
+            -v "$PWD/smoke_test.py:/app/smoke_test.py:ro" \
+            energy-monitor:pr python3 /app/smoke_test.py
