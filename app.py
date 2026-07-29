@@ -1,3 +1,4 @@
+import inspect
 import json
 import logging
 import os
@@ -110,7 +111,10 @@ MINDERGAS_GAS_FIELD = env("MINDERGAS_GAS_FIELD", "delivered")
 # hence the -1 in poll_inverter. All of these live in the input-register space (function code 4).
 REGISTERS = {
     "daily_power_yields": (5003, "U16", 0.1, "kWh"),
-    "total_power_yields": (5004, "U32", 0.1, "kWh"),
+    # Whole kWh: register 5004 carries no scaling factor (unlike the 0.1-scaled variant at 5144,
+    # which sits outside this scan block). Verified against the inverter -- 26261 kWh over
+    # total_running_time 18169 h is 1.45 kW average while generating, right for a 5 kWp array.
+    "total_power_yields": (5004, "U32", None, "kWh"),
     "internal_temperature": (5008, "S16", 0.1, "C"),
     "mppt_1_voltage": (5011, "U16", 0.1, "V"),
     "mppt_1_current": (5012, "U16", 0.1, "A"),
@@ -240,9 +244,19 @@ def decode_register(words, offset, datatype):
     raise ValueError(f"Unsupported datatype {datatype}")
 
 
+# pymodbus renamed this argument from `slave` to `device_id` (3.14 dropped `slave` outright), so
+# resolve it from the signature instead of hardcoding either name. Dependabot auto-merges anything
+# it doesn't classify as semver-major, which has already silently moved this pin once.
+_UNIT_KWARG = (
+    "device_id"
+    if "device_id" in inspect.signature(ModbusTcpClient.read_input_registers).parameters
+    else "slave"
+)
+
+
 def poll_inverter(client):
     result = client.read_input_registers(
-        address=SCAN_START_ADDRESS - 1, count=SCAN_COUNT, slave=INVERTER_SLAVE_ID
+        SCAN_START_ADDRESS - 1, count=SCAN_COUNT, **{_UNIT_KWARG: INVERTER_SLAVE_ID}
     )
     if result.isError():
         raise OSError(f"Modbus read failed: {result}")
