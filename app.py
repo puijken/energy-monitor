@@ -2,6 +2,7 @@ import inspect
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 import time
@@ -70,6 +71,16 @@ DSMR_DAY_MEASUREMENT = env("DSMR_DAY_MEASUREMENT", "electricity_day_totals")
 # Cached smart-meter values older than this are treated as absent, so a stalled DSMR-reader or
 # broker can't feed stale consumption figures into a PVOutput upload.
 DSMR_MAX_DATA_AGE = env_int("DSMR_MAX_DATA_AGE", 300)
+# If DSMR-reader's mapping includes one of these, its value is used as the InfluxDB timestamp
+# instead of our receipt time. Worth enabling `read_at` on the gas topic in particular: gas is only
+# measured every 5 minutes but republished on every telegram, so timestamping by measurement time
+# collapses ~14k duplicate points a day down to ~275 and makes "last reading before midnight"
+# exact. Falls back to receipt time when absent.
+DSMR_TIME_FIELDS = ("timestamp", "read_at")
+# Minimum spacing between InfluxDB writes per source. DSMR-reader republishes on every telegram
+# (~6s), which is finer than a dashboard needs; the in-memory cache still updates on every message,
+# so PVOutput and the metrics always see the latest values regardless. 0 disables throttling.
+DSMR_MIN_INTERVAL = env_int("DSMR_MIN_INTERVAL", 5)
 
 ENABLE_PVOUTPUT = env_bool("ENABLE_PVOUTPUT", False)
 PVOUTPUT_API_KEY = env("PVOUTPUT_API_KEY")
@@ -219,6 +230,19 @@ latest_poll_monotonic = None
 # Latest smart-meter payload per source ("elec"/"gas"/"day"), each as (values, monotonic_time).
 _dsmr_lock = threading.Lock()
 dsmr_cache = {}
+# Last (timestamp, values) written per source, so a republished-but-unchanged reading is not
+# re-POSTed. InfluxDB would collapse it anyway (same measurement+tags+time), but there is no point
+# spending the request.
+_dsmr_last_written = {}
+# Monotonic time of the last InfluxDB write per source, for DSMR_MIN_INTERVAL throttling.
+_dsmr_last_write_time = {}
+
+# InfluxDB writes for smart-meter data are handed to a worker thread rather than performed inside
+# the MQTT callback. paho dispatches on_message on its network thread, so a blocking HTTP POST there
+# stops the socket being drained and the broker discards messages for a slow consumer -- measured as
+# 6 of 20 lost with a synchronous write. Bounded so a prolonged InfluxDB outage cannot grow without
+# limit; oldest points are dropped first, since fresh readings matter more than stale ones.
+_write_queue = queue.Queue(maxsize=env_int("DSMR_WRITE_QUEUE_SIZE", 2000))
 
 
 def decode_register(words, offset, datatype):
@@ -404,6 +428,24 @@ def push_mindergas():
     log.info("Pushed to Mindergas: %s", payload)
 
 
+def parse_timestamp_ns(raw):
+    """ISO 8601 string -> epoch nanoseconds, or None if it isn't one.
+
+    A naive value is read as local time, matching how DSMR-reader renders timestamps when its
+    Django timezone is set; InfluxDB stores UTC, so the offset has to be resolved here rather than
+    left implicit.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return int(parsed.timestamp() * 1_000_000_000)
+
+
 def dsmr_topic_map():
     """Subscribed topic -> (cache key, InfluxDB measurement)."""
     return {
@@ -429,8 +471,12 @@ def _on_mqtt_message(client, userdata, message):
         # DSMR-reader publishes every value as a JSON string, so coerce to float here and drop
         # anything non-numeric rather than letting it reach InfluxDB as a string field.
         payload = json.loads(message.payload.decode("utf-8"))
-        values = {}
+        values, ts_ns = {}, None
         for field, raw in payload.items():
+            if field in DSMR_TIME_FIELDS and ts_ns is None:
+                ts_ns = parse_timestamp_ns(raw)
+                if ts_ns is not None:
+                    continue  # consumed as the point's time, not stored as a field
             try:
                 values[field] = float(raw)
             except (TypeError, ValueError):
@@ -445,12 +491,39 @@ def _on_mqtt_message(client, userdata, message):
         first = key not in dsmr_cache
         dsmr_cache[key] = (values, time.monotonic())
     if first:
-        log.info("Receiving DSMR %s data on %s: %s", key, message.topic, ", ".join(sorted(values)))
+        log.info(
+            "Receiving DSMR %s data on %s: %s (timestamped by %s)",
+            key,
+            message.topic,
+            ", ".join(sorted(values)),
+            "measurement time" if ts_ns is not None else "receipt time",
+        )
 
+    # A reading republished unchanged carries no new information.
+    if ts_ns is not None and _dsmr_last_written.get(key) == (ts_ns, values):
+        return
+    # Throttle per source. Deliberately after the cache update above, so throttling only reduces
+    # what is stored -- never what PVOutput and the metrics can see.
+    now = time.monotonic()
+    if DSMR_MIN_INTERVAL and now - _dsmr_last_write_time.get(key, 0.0) < DSMR_MIN_INTERVAL:
+        return
+    _dsmr_last_write_time[key] = now
+    if ts_ns is not None:
+        _dsmr_last_written[key] = (ts_ns, dict(values))
+
+    item = (dict(values), ts_ns if ts_ns is not None else time.time_ns(), measurement)
     try:
-        write_influxdb(values, time.time_ns(), measurement=measurement, source="dsmr")
-    except Exception:
-        log.exception("InfluxDB write failed for DSMR %s", key)
+        _write_queue.put_nowait(item)
+    except queue.Full:
+        try:
+            _write_queue.get_nowait()
+        except queue.Empty:
+            pass
+        log.warning("InfluxDB write queue full; dropped the oldest queued DSMR point")
+        try:
+            _write_queue.put_nowait(item)
+        except queue.Full:
+            pass
 
 
 def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
@@ -460,8 +533,10 @@ def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     log.info("MQTT connected to %s:%s", MQTT_HOST, MQTT_PORT)
     if ENABLE_DSMR:
         # (Re)subscribe on every connect, so a broker restart doesn't silently leave us deaf.
+        # QoS 1: at QoS 0 the broker is free to discard messages for a consumer that is slow to
+        # drain its socket, which loses readings outright.
         for topic in dsmr_topic_map():
-            client.subscribe(topic)
+            client.subscribe(topic, qos=1)
         log.info("Subscribed to DSMR topics: %s", ", ".join(dsmr_topic_map()))
 
 
@@ -486,6 +561,16 @@ def mqtt_connect():
     client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
     client.loop_start()
     return client
+
+
+def influx_writer_loop():
+    """Drains _write_queue, keeping blocking HTTP off the MQTT network thread."""
+    while True:
+        values, ts_ns, measurement = _write_queue.get()
+        try:
+            write_influxdb(values, ts_ns, measurement=measurement, source="dsmr")
+        except Exception:
+            log.exception("InfluxDB write failed for %s", measurement)
 
 
 def pvoutput_loop():
@@ -607,6 +692,7 @@ def main():
     modbus_client = ModbusTcpClient(INVERTER_HOST, port=INVERTER_PORT, timeout=10)
     mqtt_client = mqtt_connect()
 
+    threading.Thread(target=influx_writer_loop, daemon=True).start()
     threading.Thread(target=pvoutput_loop, daemon=True).start()
     threading.Thread(target=mindergas_loop, daemon=True).start()
 
