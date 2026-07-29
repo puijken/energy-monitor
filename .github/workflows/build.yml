@@ -32,7 +32,7 @@ jobs:
       # decoding at runtime can never reach :latest. Deliberately not relying on pr-validate for
       # this: dependabot auto-merge only waits for checks that branch protection marks required.
       - name: Build Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
