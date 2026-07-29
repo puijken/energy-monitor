@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Required for `load: true` to export the built image into the local docker daemon.
       - name: Set up Buildx
