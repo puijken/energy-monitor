@@ -1,0 +1,5 @@
+# pymodbus's call signature for reading registers (the `slave=` keyword argument in particular)
+# has changed across major versions, so this is pinned narrower than this repo's siblings.
+pymodbus>=3.6.0,<3.8.0
+requests~=2.0
+paho-mqtt~=2.0
