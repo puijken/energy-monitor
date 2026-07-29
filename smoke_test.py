@@ -443,6 +443,38 @@ def check_parse_timestamp_ns(failures):
     print("  parse_timestamp_ns: offset/UTC/Z/naive all resolved; garbage and numeric strings rejected")
 
 
+def check_derived_fields(failures):
+    """The power_flow point written on each poll, which exists so Grafana never has to join
+    measurements. Reuses the same inverter/DSMR fixtures as the metric checks below."""
+    before = len(failures)
+    inverter = {"total_active_power": 2888}
+    dsmr = {
+        "elec": {
+            "electricity_currently_delivered": 0.0,
+            "electricity_currently_returned": 1.644,
+        }
+    }
+
+    # solar_w = 2888
+    # grid_w  = (0.0 * 1000) - (1.644 * 1000) = -1644   (negative == feeding the grid)
+    # house_w = 2888 + (0.0 - 1.644) * 1000  =  1244
+    got = app.derived_fields(inverter, dsmr)
+    for name, want in (("solar_w", 2888.0), ("grid_w", -1644.0), ("house_w", 1244.0)):
+        if got.get(name) != want:
+            failures.append(f"  derived {name}: expected {want}, got {got.get(name)!r}")
+    if got and not all(isinstance(v, float) for v in got.values()):
+        failures.append(f"  derived fields must all be floats, got {got}")
+
+    # Without cached smart-meter data the grid/house fields must be absent, not zero -- a zero
+    # would render in Grafana as a real "house using nothing" reading.
+    solar_only = app.derived_fields(inverter, {})
+    if set(solar_only) != {"solar_w"}:
+        failures.append(f"  derived fields without DSMR: expected only solar_w, got {sorted(solar_only)}")
+
+    if len(failures) == before:
+        print("  derived fields: solar/grid/house computed together; omitted (not zeroed) without DSMR")
+
+
 def check_pvoutput_metrics(failures):
     """PVOutput metric formulas in app.METRICS, and build_pvoutput_params() degrading to
     inverter-only output when no smart-meter data is cached."""
@@ -528,6 +560,7 @@ def main():
     check_dsmr_mqtt_message(failures)
     check_parse_timestamp_ns(failures)
     check_pvoutput_metrics(failures)
+    check_derived_fields(failures)
 
     signal.alarm(0)
 
@@ -537,7 +570,7 @@ def main():
         return 1
 
     print("smoke test passed: modbus, mqtt connect, influxdb write, dsmr parsing, timestamps, "
-          "pvoutput metrics")
+          "pvoutput metrics, derived fields")
     return 0
 
 

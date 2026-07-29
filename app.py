@@ -79,6 +79,13 @@ DSMR_MAX_DATA_AGE = env_int("DSMR_MAX_DATA_AGE", 300)
 # collapses ~14k duplicate points a day down to ~275 and makes "last reading before midnight"
 # exact. Falls back to receipt time when absent.
 DSMR_TIME_FIELDS = ("timestamp", "read_at")
+# Solar, grid and house power written together as one measurement, from values held in memory at
+# the same instant. Grafana then needs no cross-measurement join: InfluxQL has none (it evaluates
+# an expression per measurement, so the other measurement's fields come back null), and while
+# InfluxDB 3's SQL can join, doing it at query time means bucketing two series that were written
+# at different moments and reconciling them after the fact. Here they are genuinely simultaneous.
+ENABLE_DERIVED = env_bool("ENABLE_DERIVED", True)
+DERIVED_MEASUREMENT = env("DERIVED_MEASUREMENT", "power_flow")
 # Minimum spacing between InfluxDB writes per source. DSMR-reader republishes on every telegram
 # (~6s), which is finer than a dashboard needs; the in-memory cache still updates on every message,
 # so PVOutput and the metrics always see the latest values regardless. 0 disables throttling.
@@ -577,6 +584,22 @@ def mqtt_watchdog_loop(mqtt_client):
             warned = True
 
 
+def derived_fields(values, dsmr_values):
+    """Power flow at one instant: what the panels produce, what the grid does, what the house uses.
+
+    grid_w is signed the way a meter reads: positive drawing from the grid, negative feeding back.
+    Grid and house fields are omitted rather than zeroed when no fresh smart-meter data is cached,
+    so a DSMR outage shows as a gap in Grafana instead of a plausible-looking 0 W.
+    """
+    fields = {"solar_w": float(values["total_active_power"])}
+    if "elec" in dsmr_values:
+        imported = METRICS["grid_import_w"][1](values, dsmr_values)
+        exported = METRICS["grid_export_w"][1](values, dsmr_values)
+        fields["grid_w"] = float(imported - exported)
+        fields["house_w"] = float(METRICS["house_power_w"][1](values, dsmr_values))
+    return fields
+
+
 def queue_write(values, ts_ns, measurement, source):
     """Hands a point to the writer thread, dropping the oldest if the queue is saturated."""
     item = (dict(values), ts_ns, measurement, source)
@@ -760,6 +783,16 @@ def main():
             # physical display reads those) and vice versa. The InfluxDB write is queued rather
             # than performed here, so its latency never stretches the poll interval.
             queue_write(values, ts_ns, INFLUXDB_MEASUREMENT, "sungrow")
+            if ENABLE_DERIVED:
+                try:
+                    queue_write(
+                        derived_fields(values, get_dsmr_values() if ENABLE_DSMR else {}),
+                        ts_ns,
+                        DERIVED_MEASUREMENT,
+                        "derived",
+                    )
+                except Exception:
+                    log.exception("Could not compute derived power flow")
             try:
                 publish_mqtt(mqtt_client, values)
             except Exception:
