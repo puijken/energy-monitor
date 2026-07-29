@@ -135,15 +135,25 @@ REGISTERS = {
     # which sits outside this scan block). Verified against the inverter -- 26261 kWh over
     # total_running_time 18169 h is 1.45 kW average while generating, right for a 5 kWp array.
     "total_power_yields": (5004, "U32", None, "kWh"),
+    "total_running_time": (5006, "U32", None, "h"),
     "internal_temperature": (5008, "S16", 0.1, "C"),
+    # Apparent power alongside active power gives power factor as a query-time division.
+    # Read 3292 VA against 3300 W active, so this model reports it essentially unity.
+    "total_apparent_power": (5009, "U32", None, "VA"),
     "mppt_1_voltage": (5011, "U16", 0.1, "V"),
     "mppt_1_current": (5012, "U16", 0.1, "A"),
     "mppt_2_voltage": (5013, "U16", 0.1, "V"),
     "mppt_2_current": (5014, "U16", 0.1, "A"),
     "total_dc_power": (5017, "U32", None, "W"),
     "phase_a_voltage": (5019, "U16", 0.1, "V"),
+    "phase_a_current": (5022, "S16", 0.1, "A"),
     "total_active_power": (5031, "U32", None, "W"),
 }
+# Deliberately absent: installed_pv_power (5016) reads 0 on this unit rather than the array
+# size, so dashboards carry the 6.32 kWp figure as a constant instead. phase_b/c_voltage
+# (5020/5021) and mppt_3 (5015/5016) read 0 too -- this is a single-phase, two-string model.
+# Every register above already falls inside the one block poll_inverter reads, so none of
+# them costs an extra Modbus round trip.
 SCAN_START_ADDRESS = min(addr for addr, *_ in REGISTERS.values())
 SCAN_END_ADDRESS = max(addr + (1 if dtype in ("U32", "S32") else 0) for addr, dtype, *_ in REGISTERS.values())
 SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1

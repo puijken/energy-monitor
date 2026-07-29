@@ -59,7 +59,11 @@ RAW = {
     5002: 83,       # daily_power_yields   U16 x0.1 -> 8.3 kWh
     5003: 26261,    # total_power_yields   U32 low
     5004: 0,        #                      U32 high -> 26261 kWh (unscaled)
+    5005: 18173,    # total_running_time   U32 low
+    5006: 0,        #                      U32 high -> 18173 h
     5007: 571,      # internal_temperature S16 x0.1 -> 57.1 C
+    5008: 2990,     # total_apparent_power U32 low
+    5009: 0,        #                      U32 high -> 2990 VA
     5010: 2567,     # mppt_1_voltage       -> 256.7 V
     5011: 29,       # mppt_1_current       -> 2.9 A
     5012: 2317,     # mppt_2_voltage       -> 231.7 V
@@ -67,19 +71,23 @@ RAW = {
     5016: 2968,     # total_dc_power       U32 low
     5017: 0,        #                      U32 high -> 2968 W
     5018: 2378,     # phase_a_voltage      -> 237.8 V
+    5021: 122,      # phase_a_current      S16 x0.1 -> 12.2 A
     5030: 2888,     # total_active_power   U32 low
     5031: 0,        #                      U32 high -> 2888 W
 }
 EXPECTED = {
     "daily_power_yields": 8.3,
     "total_power_yields": 26261,
+    "total_running_time": 18173,
     "internal_temperature": 57.1,
+    "total_apparent_power": 2990,
     "mppt_1_voltage": 256.7,
     "mppt_1_current": 2.9,
     "mppt_2_voltage": 231.7,
     "mppt_2_current": 9.5,
     "total_dc_power": 2968,
     "phase_a_voltage": 237.8,
+    "phase_a_current": 12.2,
     "total_active_power": 2888,
     "run_state": "ON",
 }
@@ -145,6 +153,16 @@ def check_modbus_poll(failures):
         failures.append(f"  AC output {ac}W exceeds DC input {dc}W")
     if abs(mppt - dc) / dc > 0.05:
         failures.append(f"  MPPT sum {mppt:.0f}W disagrees with total_dc_power {dc}W by >5%")
+
+    # Apparent power can never be less than active power, and volts times amps on the AC side has
+    # to land back on active power. Both catch a word-order or scaling slip on the registers added
+    # later than the original block, which a single-value comparison would not.
+    va = values["total_apparent_power"]
+    if va < ac:
+        failures.append(f"  apparent power {va}VA is below active power {ac}W")
+    ac_from_vi = values["phase_a_voltage"] * values["phase_a_current"]
+    if abs(ac_from_vi - ac) / ac > 0.05:
+        failures.append(f"  phase A V*I {ac_from_vi:.0f}W disagrees with active power {ac}W by >5%")
 
     # Line protocol must stay parseable and consistently typed.
     line = app.line_protocol_field("total_active_power", ac)
