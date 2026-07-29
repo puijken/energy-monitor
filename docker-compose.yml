@@ -3,16 +3,23 @@ services:
     image: ghcr.io/puijken/energy-monitor:latest
     environment:
       - TZ=Europe/Amsterdam
-      - INVERTER_HOST=10.0.200.98
+      # Inverter / dongle address on your network
+      - INVERTER_HOST=192.168.1.50
       - INVERTER_PORT=502
       - SCAN_INTERVAL=15
       - INFLUXDB_URL=http://influxdb:8181
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
       - INFLUXDB_DATABASE=energy
-      - MQTT_HOST=10.0.12.132
+      # Broker used both to publish solar values and to consume DSMR-reader's exports
+      - MQTT_HOST=192.168.1.10
       - MQTT_USERNAME=${MQTT_USERNAME}
       - MQTT_PASSWORD=${MQTT_PASSWORD}
       - MQTT_TOPIC_PREFIX=energy/solar
+      # Smart meter, via DSMR-reader's MQTT export (enable the JSON exports in its admin UI)
+      - ENABLE_DSMR=true
+      - DSMR_TOPIC_ELEC=dsmr/json/elec
+      - DSMR_TOPIC_GAS=dsmr/json/gas
+      - DSMR_TOPIC_DAY=dsmr/day-consumption
       - ENABLE_PVOUTPUT=false
       - PVOUTPUT_API_KEY=${PVOUTPUT_API_KEY}
       - PVOUTPUT_SYSTEM_ID=${PVOUTPUT_SYSTEM_ID}
