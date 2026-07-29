@@ -193,6 +193,28 @@ Timestamps are timezone-aware on purpose: InfluxDB stores UTC and interprets a n
 so passing naive local time would shift the window by the local offset and select the wrong day's
 reading.
 
+## Tests
+
+`smoke_test.py` starts an in-process Modbus server serving known register values, polls it through
+`app.poll_inverter`, and asserts the decoded results — including that DC input covers AC output and
+that the MPPT strings account for the DC total, which catches word-order and scaling regressions.
+
+```bash
+docker build -t energy-monitor:dev .
+docker run --rm -v "$PWD/smoke_test.py:/app/smoke_test.py:ro" energy-monitor:dev python3 /app/smoke_test.py
+```
+
+Both workflows run it: `pr-validate.yml` on pull requests, and `build.yml` **before** pushing the
+image, so a dependency bump that breaks decoding at runtime can never reach `:latest`. That matters
+because building alone proves nothing here — pymodbus 3.14 removed the `slave=` keyword in favour of
+`device_id=`, which built cleanly and failed on every poll. The app now resolves that argument name
+from the function signature, and the test would catch the next such change.
+
+Note that Dependabot auto-merges anything it doesn't classify as `semver-major`, and it only waits
+for status checks that branch protection marks **required**. Without branch protection on `main`,
+`pr-validate` will not block a merge — the pre-push check in `build.yml` is what actually protects
+the published image.
+
 ## Docker Compose
 
 See `docker-compose.yml` in this repo for a usage example. A typical deployment has this
