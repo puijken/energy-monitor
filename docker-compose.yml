@@ -1,0 +1,21 @@
+services:
+  energy-monitor:
+    image: ghcr.io/puijken/energy-monitor:latest
+    environment:
+      - TZ=Europe/Amsterdam
+      - INVERTER_HOST=192.168.1.50
+      - INVERTER_PORT=502
+      - SCAN_INTERVAL=15
+      - INFLUXDB_URL=http://influxdb:8181
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
+      - INFLUXDB_DATABASE=energy
+      - MQTT_HOST=192.168.1.10
+      - MQTT_USERNAME=${MQTT_USERNAME}
+      - MQTT_PASSWORD=${MQTT_PASSWORD}
+      - MQTT_TOPIC_PREFIX=energy/solar
+      - ENABLE_PVOUTPUT=false
+      - PVOUTPUT_API_KEY=${PVOUTPUT_API_KEY}
+      - PVOUTPUT_SYSTEM_ID=${PVOUTPUT_SYSTEM_ID}
+      - ENABLE_MINDERGAS=false
+      - MINDERGAS_API_KEY=${MINDERGAS_API_KEY}
+    restart: unless-stopped
