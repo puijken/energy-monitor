@@ -5,6 +5,13 @@ on:
     branches:
       - main
   workflow_dispatch:
+  # Builds are otherwise on-demand. This monthly run exists only to refresh the base image: it is
+  # pinned by tag, and Dependabot bumps tags rather than digests, so an upstream security rebuild
+  # of the same tag produces no PR and therefore no build. No `no-cache` is needed -- there is no
+  # layer cache configured and `pull: true` below re-resolves the tag against the registry, so
+  # every build is already fully fresh. This only guarantees one happens.
+  schedule:
+    - cron: '0 1 1 * *'  # 01:00 UTC on the 1st of each month
 
 jobs:
   build:
