@@ -513,19 +513,7 @@ def _on_mqtt_message(client, userdata, message):
     if ts_ns is not None:
         _dsmr_last_written[key] = (ts_ns, dict(values))
 
-    item = (dict(values), ts_ns if ts_ns is not None else time.time_ns(), measurement)
-    try:
-        _write_queue.put_nowait(item)
-    except queue.Full:
-        try:
-            _write_queue.get_nowait()
-        except queue.Empty:
-            pass
-        log.warning("InfluxDB write queue full; dropped the oldest queued DSMR point")
-        try:
-            _write_queue.put_nowait(item)
-        except queue.Full:
-            pass
+    queue_write(values, ts_ns if ts_ns is not None else time.time_ns(), measurement, "dsmr")
 
 
 def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
@@ -589,12 +577,36 @@ def mqtt_watchdog_loop(mqtt_client):
             warned = True
 
 
+def queue_write(values, ts_ns, measurement, source):
+    """Hands a point to the writer thread, dropping the oldest if the queue is saturated."""
+    item = (dict(values), ts_ns, measurement, source)
+    try:
+        _write_queue.put_nowait(item)
+        return
+    except queue.Full:
+        pass
+    try:
+        _write_queue.get_nowait()
+    except queue.Empty:
+        pass
+    log.warning("InfluxDB write queue full; dropped the oldest queued point")
+    try:
+        _write_queue.put_nowait(item)
+    except queue.Full:
+        pass
+
+
 def influx_writer_loop():
-    """Drains _write_queue, keeping blocking HTTP off the MQTT network thread."""
+    """Drains _write_queue.
+
+    Every InfluxDB write goes through here so no producer ever blocks on it. That matters more than
+    it sounds: a write takes ~500ms against a local InfluxDB 3, which would otherwise stretch the
+    poll interval and stall paho's network thread.
+    """
     while True:
-        values, ts_ns, measurement = _write_queue.get()
+        values, ts_ns, measurement, source = _write_queue.get()
         try:
-            write_influxdb(values, ts_ns, measurement=measurement, source="dsmr")
+            write_influxdb(values, ts_ns, measurement=measurement, source=source)
         except Exception:
             log.exception("InfluxDB write failed for %s", measurement)
 
@@ -724,6 +736,7 @@ def main():
     threading.Thread(target=mindergas_loop, daemon=True).start()
 
     while True:
+        cycle_started = time.monotonic()
         try:
             if not modbus_client.connected and not modbus_client.connect():
                 raise OSError(f"Could not connect to inverter at {INVERTER_HOST}:{INVERTER_PORT}")
@@ -744,11 +757,9 @@ def main():
             )
 
             # Each sink is independent: an InfluxDB outage must not stop MQTT updates (the
-            # physical display reads those) and vice versa.
-            try:
-                write_influxdb(values, ts_ns)
-            except Exception:
-                log.exception("InfluxDB write failed")
+            # physical display reads those) and vice versa. The InfluxDB write is queued rather
+            # than performed here, so its latency never stretches the poll interval.
+            queue_write(values, ts_ns, INFLUXDB_MEASUREMENT, "sungrow")
             try:
                 publish_mqtt(mqtt_client, values)
             except Exception:
@@ -756,7 +767,9 @@ def main():
         except Exception:
             log.exception("Inverter poll failed")
 
-        time.sleep(SCAN_INTERVAL)
+        # Sleep only for the remainder of the interval, so the cadence stays SCAN_INTERVAL rather
+        # than SCAN_INTERVAL plus however long the work took.
+        time.sleep(max(0.0, SCAN_INTERVAL - (time.monotonic() - cycle_started)))
 
 
 if __name__ == "__main__":
