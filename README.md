@@ -30,6 +30,7 @@ over.
 
 | Variable | Default | Description |
 |---|---|---|
+| `LOG_LEVEL` | `WARNING` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` (case-insensitive). See [Log levels](#log-levels). |
 | `INVERTER_HOST` | *required* | Inverter/dongle IP address |
 | `INVERTER_PORT` | `502` | Modbus TCP port |
 | `INVERTER_SLAVE_ID` | `1` | Modbus slave/unit ID |
@@ -66,6 +67,25 @@ over.
 | `MINDERGAS_GAS_MEASUREMENT` | `gas_positions` | InfluxDB measurement DSMR-reader writes gas readings to |
 | `MINDERGAS_GAS_FIELD` | `delivered` | Field name within that measurement |
 | `TZ` | *(container default)* | Timezone for scheduling/logging |
+
+## Log levels
+
+`LOG_LEVEL` sets the minimum severity written to stdout; everything below it is silent. The
+default, `WARNING`, is the minimal-logging setting for normal operation:
+
+| Level | Shows | When to use it |
+|---|---|---|
+| `WARNING` (default) | Config problems, connection loss/refusal, a full write queue, a stale poll skipping an upload, and every caught exception (always logged at error severity with a traceback, regardless of this setting) | Normal operation. Silences the 5-second poll heartbeat and routine push confirmations, so healthy running produces no output at all. |
+| `INFO` | The above, plus the recurring poll heartbeat (`Poll ok: ac=...`), startup/connection confirmations, and successful PVOutput/Mindergas pushes | Confirming the container is alive and doing what's expected, without full per-field detail. |
+| `DEBUG` | The above, plus per-field detail such as a DSMR value that failed to parse and was dropped | Diagnosing a specific data problem, e.g. a smart-meter field arriving as something unexpected. |
+| `ERROR` | Only config problems and caught exceptions | Quieter than the default; loses the connection-state warnings (MQTT disconnects, a full write queue), which are usually the useful signal before something breaks outright. |
+| `CRITICAL` | Practically nothing — this file has no `log.critical` calls | Not useful here; included only because it's one of Python's standard levels. |
+
+An unrecognised value (e.g. a typo) does not stop the container: it falls back to `WARNING` and
+prints one line to stderr naming the invalid value and the valid options.
+
+Change it with a redeploy (`docker compose up -d energy-monitor` after editing the compose file's
+`LOG_LEVEL`) — there's no way to change it on a running container without restarting it.
 
 ## Modbus register map
 

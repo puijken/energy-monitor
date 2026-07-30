@@ -12,7 +12,34 @@ import paho.mqtt.client as mqtt
 import requests
 from pymodbus.client import ModbusTcpClient
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+LOG_LEVELS = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING,
+              "ERROR": logging.ERROR, "CRITICAL": logging.CRITICAL}
+
+
+def resolve_log_level(raw, default="WARNING"):
+    """Map a LOG_LEVEL env value to a logging level, falling back to `default` on anything else.
+
+    Returns (level_int, warning_message_or_None) rather than logging directly, since this runs
+    before the logger below exists -- the module-level caller is responsible for printing the
+    warning to stderr.
+    """
+    key = (raw or default).strip().upper()
+    if key in LOG_LEVELS:
+        return LOG_LEVELS[key], None
+    return LOG_LEVELS[default], (
+        f"Invalid LOG_LEVEL {key!r}; falling back to {default}. Valid values: {', '.join(LOG_LEVELS)}"
+    )
+
+
+# Resolved before any other env var, and without the env()/log helpers below, since the logger
+# itself doesn't exist yet. Default WARNING for production: this hides the 5-second poll
+# heartbeat and successful-push confirmations (all INFO), while every failure path in this file
+# uses warning/error/exception and so always surfaces regardless of this setting.
+_log_level, _log_level_warning = resolve_log_level(os.environ.get("LOG_LEVEL"))
+if _log_level_warning:
+    print(_log_level_warning, file=sys.stderr)
+
+logging.basicConfig(level=_log_level, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
 log = logging.getLogger("energy-monitor")
 
 

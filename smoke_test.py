@@ -461,6 +461,44 @@ def check_parse_timestamp_ns(failures):
     print("  parse_timestamp_ns: offset/UTC/Z/naive all resolved; garbage and numeric strings rejected")
 
 
+def check_log_level(failures):
+    """app.resolve_log_level(): default WARNING for a minimal-logging production run, any of the
+    five standard names case-insensitively, and a safe fallback (with a warning, not a crash) on
+    anything else -- a typo in LOG_LEVEL must not take the container down."""
+    cases = [
+        (None, "WARNING", "unset"),
+        ("warning", "WARNING", "lowercase"),
+        ("Debug", "DEBUG", "mixed case"),
+        ("  INFO  ", "INFO", "surrounding whitespace"),
+        ("ERROR", "ERROR", "exact"),
+        ("CRITICAL", "CRITICAL", "exact"),
+    ]
+    for raw, expected_name, label in cases:
+        level, warning = app.resolve_log_level(raw)
+        if level != app.LOG_LEVELS[expected_name]:
+            failures.append(f"  resolve_log_level({raw!r}) [{label}]: expected {expected_name}, got {level}")
+        if warning is not None:
+            failures.append(f"  resolve_log_level({raw!r}) [{label}]: unexpected warning {warning!r}")
+
+    # An empty string is how an unset value looks in a .env file (LOG_LEVEL=) -- treated the same
+    # as absent, defaulting silently rather than warning about it.
+    level, warning = app.resolve_log_level("")
+    if level != app.LOG_LEVELS["WARNING"]:
+        failures.append(f"  resolve_log_level(''): expected default WARNING, got {level}")
+    if warning is not None:
+        failures.append(f"  resolve_log_level(''): expected no warning for an empty value, got {warning!r}")
+
+    for bad in ("verbose", "warn", "trace"):
+        level, warning = app.resolve_log_level(bad)
+        if level != app.LOG_LEVELS["WARNING"]:
+            failures.append(f"  resolve_log_level({bad!r}): expected fallback to WARNING, got {level}")
+        if warning is None:
+            failures.append(f"  resolve_log_level({bad!r}): expected a fallback warning, got None")
+
+    print("  log level: defaults to WARNING, accepts DEBUG/INFO/WARNING/ERROR/CRITICAL "
+          "case-insensitively, falls back safely on anything else")
+
+
 def check_derived_fields(failures):
     """The power_flow point written on each poll, which exists so Grafana never has to join
     measurements. Reuses the same inverter/DSMR fixtures as the metric checks below."""
@@ -579,6 +617,7 @@ def main():
     check_parse_timestamp_ns(failures)
     check_pvoutput_metrics(failures)
     check_derived_fields(failures)
+    check_log_level(failures)
 
     signal.alarm(0)
 
@@ -588,7 +627,7 @@ def main():
         return 1
 
     print("smoke test passed: modbus, mqtt connect, influxdb write, dsmr parsing, timestamps, "
-          "pvoutput metrics, derived fields")
+          "pvoutput metrics, derived fields, log level")
     return 0
 
 
