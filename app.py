@@ -6,9 +6,10 @@ import queue
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import paho.mqtt.client as mqtt
+import psycopg
 import requests
 from pymodbus.client import ModbusTcpClient
 
@@ -69,10 +70,12 @@ INVERTER_PORT = env_int("INVERTER_PORT", 502)
 INVERTER_SLAVE_ID = env_int("INVERTER_SLAVE_ID", 1)
 SCAN_INTERVAL = env_int("SCAN_INTERVAL", 15)
 
-INFLUXDB_URL = env("INFLUXDB_URL", required=True).rstrip("/")  # e.g. http://influxdb:8181
-INFLUXDB_TOKEN = env("INFLUXDB_TOKEN", required=True)
-INFLUXDB_DATABASE = env("INFLUXDB_DATABASE", "energy")
-INFLUXDB_MEASUREMENT = env("INFLUXDB_MEASUREMENT", "solar")
+POSTGRES_HOST = env("POSTGRES_HOST", required=True)
+POSTGRES_PORT = env_int("POSTGRES_PORT", 5432)
+POSTGRES_DB = env("POSTGRES_DB", "energy")
+POSTGRES_USER = env("POSTGRES_USER", required=True)
+POSTGRES_PASSWORD = env("POSTGRES_PASSWORD", required=True)
+POSTGRES_TABLE = env("POSTGRES_TABLE", "solar")
 
 MQTT_HOST = env("MQTT_HOST", required=True)
 MQTT_PORT = env_int("MQTT_PORT", 1883)
@@ -94,13 +97,13 @@ ENABLE_DSMR = env_bool("ENABLE_DSMR", True)
 DSMR_TOPIC_ELEC = env("DSMR_TOPIC_ELEC", "dsmr/json/elec")
 DSMR_TOPIC_GAS = env("DSMR_TOPIC_GAS", "dsmr/json/gas")
 DSMR_TOPIC_DAY = env("DSMR_TOPIC_DAY", "dsmr/day-consumption")
-DSMR_ELEC_MEASUREMENT = env("DSMR_ELEC_MEASUREMENT", "electricity")
-DSMR_GAS_MEASUREMENT = env("DSMR_GAS_MEASUREMENT", "gas_positions")
-DSMR_DAY_MEASUREMENT = env("DSMR_DAY_MEASUREMENT", "electricity_day_totals")
+DSMR_ELEC_TABLE = env("DSMR_ELEC_TABLE", "electricity")
+DSMR_GAS_TABLE = env("DSMR_GAS_TABLE", "gas_positions")
+DSMR_DAY_TABLE = env("DSMR_DAY_TABLE", "electricity_day_totals")
 # Cached smart-meter values older than this are treated as absent, so a stalled DSMR-reader or
 # broker can't feed stale consumption figures into a PVOutput upload.
 DSMR_MAX_DATA_AGE = env_int("DSMR_MAX_DATA_AGE", 300)
-# If DSMR-reader's mapping includes one of these, its value is used as the InfluxDB timestamp
+# If DSMR-reader's mapping includes one of these, its value is used as the point's timestamp
 # instead of our receipt time. Worth enabling `read_at` on the gas topic in particular: gas is only
 # measured every 5 minutes but republished on every telegram, so timestamping by measurement time
 # collapses ~14k duplicate points a day down to ~275 and makes "last reading before midnight"
@@ -115,9 +118,9 @@ DSMR_TIME_FIELDS = ("timestamp", "read_at")
 # swapped for a different model needs no code change.
 ENABLE_PLUGS = env_bool("ENABLE_PLUGS", False)
 # "topic=label,topic=label", e.g. "zigbee2mqtt/Plug A=server". The label becomes the
-# InfluxDB tag value, so keep it short and stable even if the zigbee2mqtt friendly name changes.
+# `source` column value, so keep it short and stable even if the zigbee2mqtt friendly name changes.
 PLUG_TOPICS = env("PLUG_TOPICS", "")
-PLUG_MEASUREMENT = env("PLUG_MEASUREMENT", "smart_plugs")
+PLUG_TABLE = env("PLUG_TABLE", "smart_plugs")
 PLUG_FIELDS = ("power", "energy", "current", "voltage")
 # Mirrors DSMR_MIN_INTERVAL: these plugs report on every attribute change, multiple times a
 # minute, finer than a dashboard needs.
@@ -145,14 +148,12 @@ def parse_plug_topics(raw):
 
 PLUG_TOPIC_MAP = parse_plug_topics(PLUG_TOPICS)
 
-# Solar, grid and house power written together as one measurement, from values held in memory at
-# the same instant. Grafana then needs no cross-measurement join: InfluxQL has none (it evaluates
-# an expression per measurement, so the other measurement's fields come back null), and while
-# InfluxDB 3's SQL can join, doing it at query time means bucketing two series that were written
-# at different moments and reconciling them after the fact. Here they are genuinely simultaneous.
+# Solar, grid and house power written together as one table, from values held in memory at the
+# same instant -- a live as-of join across independently-polled solar/DSMR readings would be
+# more complex and costly than continuing to compute this once, at ingest.
 ENABLE_DERIVED = env_bool("ENABLE_DERIVED", True)
-DERIVED_MEASUREMENT = env("DERIVED_MEASUREMENT", "power_flow")
-# Minimum spacing between InfluxDB writes per source. DSMR-reader republishes on every telegram
+DERIVED_TABLE = env("DERIVED_TABLE", "power_flow")
+# Minimum spacing between Postgres writes per source. DSMR-reader republishes on every telegram
 # (~6s), which is finer than a dashboard needs; the in-memory cache still updates on every message,
 # so PVOutput and the metrics always see the latest values regardless. 0 disables throttling.
 DSMR_MIN_INTERVAL = env_int("DSMR_MIN_INTERVAL", 5)
@@ -181,10 +182,10 @@ MINDERGAS_HOUR = env_int("MINDERGAS_HOUR", 0)
 MINDERGAS_MINUTE = env_int("MINDERGAS_MINUTE", 5)
 MINDERGAS_RETRY_INTERVAL = env_int("MINDERGAS_RETRY_INTERVAL", 900)
 # Where to read the gas meter position back from. Defaults line up with what this container
-# writes from DSMR_TOPIC_GAS, so they only need changing if DSMR_GAS_MEASUREMENT is customised.
-# This one genuinely does read from InfluxDB rather than the MQTT cache: Mindergas wants the last
+# writes from DSMR_TOPIC_GAS, so they only need changing if DSMR_GAS_TABLE is customised. This
+# one genuinely does read from Postgres rather than the MQTT cache: Mindergas wants the last
 # reading *before local midnight*, which needs timestamped history, not the current value.
-MINDERGAS_GAS_MEASUREMENT = env("MINDERGAS_GAS_MEASUREMENT", DSMR_GAS_MEASUREMENT)
+MINDERGAS_GAS_TABLE = env("MINDERGAS_GAS_TABLE", DSMR_GAS_TABLE)
 MINDERGAS_GAS_FIELD = env("MINDERGAS_GAS_FIELD", "delivered")
 
 # Modbus register map for the Sungrow SG5.0RS (device_type_code 0x2606, nominal 5.0 kW) -- a
@@ -224,6 +225,25 @@ SCAN_START_ADDRESS = min(addr for addr, *_ in REGISTERS.values())
 SCAN_END_ADDRESS = max(addr + (1 if dtype in ("U32", "S32") else 0) for addr, dtype, *_ in REGISTERS.values())
 SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1
 
+# Fixed columns per table, matching the Postgres schema in the deploying stack's
+# timescaledb/init/001_hypertables.sql. A field not listed here for its table lands in that
+# table's `extra` JSONB column instead of failing the insert -- this is what keeps DSMR/plug
+# ingestion schemaless from this module's perspective (enabling a new DSMR field per
+# that DSMR-reader publishes needs no code change here, only a schema/dashboard change
+# once it's actually wanted).
+TABLE_COLUMNS = {
+    POSTGRES_TABLE: set(REGISTERS) | {"run_state"},
+    DSMR_ELEC_TABLE: {
+        "electricity_delivered_1", "electricity_returned_1", "electricity_delivered_2",
+        "electricity_returned_2", "electricity_currently_delivered",
+        "electricity_currently_returned", "phase_voltage_l1",
+    },
+    DSMR_GAS_TABLE: {"delivered"},
+    DSMR_DAY_TABLE: {"electricity_merged", "electricity_returned_merged"},
+    PLUG_TABLE: set(PLUG_FIELDS) | {"state"},
+    DERIVED_TABLE: {"solar_w", "grid_w", "house_w"},
+}
+
 
 def _f(source, values, field):
     try:
@@ -241,7 +261,7 @@ def _elec(d, field):
 #
 # Each entry is (DSMR sources required, function(inverter_values, dsmr_values)). Metrics with an
 # empty tuple come straight from Modbus; the rest read the cached smart-meter payloads that arrive
-# over MQTT, so no InfluxDB round-trip is involved and they stay usable even if writes are failing.
+# over MQTT, so no Postgres round-trip is involved and they stay usable even if writes are failing.
 METRICS = {
     # --- inverter only (always available) ---
     "daily_generation_wh": ((), lambda i, d: round(i["daily_power_yields"] * 1000)),
@@ -316,22 +336,24 @@ latest_poll_monotonic = None
 _dsmr_lock = threading.Lock()
 dsmr_cache = {}
 # Last (timestamp, values) written per source, so a republished-but-unchanged reading is not
-# re-POSTed. InfluxDB would collapse it anyway (same measurement+tags+time), but there is no point
-# spending the request.
+# rewritten. Postgres would collapse it anyway (ON CONFLICT on the same time+source), but there
+# is no point spending the write.
 _dsmr_last_written = {}
-# Monotonic time of the last InfluxDB write per source, for DSMR_MIN_INTERVAL throttling.
+# Monotonic time of the last Postgres write per source, for DSMR_MIN_INTERVAL throttling.
 _dsmr_last_write_time = {}
 
-# Monotonic time of the last InfluxDB write per plug label, for PLUG_MIN_INTERVAL throttling.
+# Monotonic time of the last Postgres write per plug label, for PLUG_MIN_INTERVAL throttling.
 _plug_last_write_time = {}
 # Labels already logged once at INFO on first message, so ongoing traffic doesn't repeat it.
 _plug_seen = set()
 
-# InfluxDB writes for smart-meter data are handed to a worker thread rather than performed inside
-# the MQTT callback. paho dispatches on_message on its network thread, so a blocking HTTP POST there
+# Postgres writes for smart-meter data are handed to a worker thread rather than performed inside
+# the MQTT callback. paho dispatches on_message on its network thread, so a blocking write there
 # stops the socket being drained and the broker discards messages for a slow consumer -- measured as
-# 6 of 20 lost with a synchronous write. Bounded so a prolonged InfluxDB outage cannot grow without
-# limit; oldest points are dropped first, since fresh readings matter more than stale ones.
+# 6 of 20 lost with a synchronous write (against the old HTTP-based InfluxDB write path, but the
+# same physical constraint applies to any blocking write here). Bounded so a prolonged Postgres
+# outage cannot grow without limit; oldest points are dropped first, since fresh readings matter
+# more than stale ones.
 _write_queue = queue.Queue(maxsize=env_int("DSMR_WRITE_QUEUE_SIZE", 2000))
 
 
@@ -387,38 +409,68 @@ def poll_inverter(client):
     return values
 
 
-def line_protocol_field(name, value):
-    if isinstance(value, str):
-        escaped = value.replace('"', '\\"')
-        return f'{name}="{escaped}"'
-    # Always emit a float so a field's type can never flip between writes (an integer-looking
-    # value written unsuffixed is a float to InfluxDB anyway; being explicit keeps it stable).
-    return f"{name}={float(value)}"
+_pg_conn = None
 
 
-def write_influxdb(values, ts_ns, measurement=None, source="sungrow"):
-    fields = ",".join(line_protocol_field(name, value) for name, value in values.items())
-    body = f"{measurement or INFLUXDB_MEASUREMENT},source={source} {fields} {ts_ns}"
+def get_pg_write_connection():
+    """Returns the persistent connection used by the writer thread, (re)connecting on demand.
 
-    resp = requests.post(
-        f"{INFLUXDB_URL}/api/v3/write_lp",
-        params={"db": INFLUXDB_DATABASE, "precision": "nanosecond"},
-        headers={"Authorization": f"Bearer {INFLUXDB_TOKEN}", "Content-Type": "text/plain"},
-        data=body,
-        timeout=10,
-    )
-    resp.raise_for_status()
+    A single connection reused by the one writer thread -- no pool needed, since nothing else
+    ever writes concurrently (mirrors the single-persistent-HTTP-session shape of the old
+    InfluxDB write path). Autocommit, since each write is already its own unit of work.
+    """
+    global _pg_conn
+    if _pg_conn is None or _pg_conn.closed:
+        _pg_conn = psycopg.connect(
+            host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
+            user=POSTGRES_USER, password=POSTGRES_PASSWORD, autocommit=True,
+        )
+    return _pg_conn
 
 
-def query_influxdb_sql(sql):
-    resp = requests.post(
-        f"{INFLUXDB_URL}/api/v3/query_sql",
-        headers={"Authorization": f"Bearer {INFLUXDB_TOKEN}"},
-        json={"db": INFLUXDB_DATABASE, "q": sql},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def write_postgres(values, ts_ns, table=None, source="sungrow"):
+    """Writes one point to `table`, split into known fixed columns plus `extra` for anything
+    not in TABLE_COLUMNS. ON CONFLICT DO UPDATE mirrors the old InfluxDB write path's semantics:
+    writing the same (time, source) again overwrites rather than silently keeping the first
+    write, which matters for the rare case of a corrected re-publish at the same measurement
+    timestamp (see DSMR_TIME_FIELDS)."""
+    table = table or POSTGRES_TABLE
+    known = TABLE_COLUMNS.get(table, set())
+    direct = {k: v for k, v in values.items() if k in known}
+    extra = {k: v for k, v in values.items() if k not in known}
+
+    ts = datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=timezone.utc)
+    columns = ["time", "source", "extra"] + list(direct)
+    params = [ts, source, json.dumps(extra) if extra else None] + list(direct.values())
+    placeholders = ", ".join(["%s"] * len(columns))
+    col_list = ", ".join(columns)
+    update_cols = ["extra"] + list(direct)
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+
+    conn = get_pg_write_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT (time, source) DO UPDATE SET {set_clause}",
+            params,
+        )
+
+
+def get_last_gas_reading(window_start, window_end):
+    """Last (time, value) of MINDERGAS_GAS_FIELD in MINDERGAS_GAS_TABLE within
+    [window_start, window_end), or None. Opens a short-lived connection rather than sharing the
+    writer thread's persistent one -- this runs at most once a day, from a different thread."""
+    with psycopg.connect(
+        host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
+        user=POSTGRES_USER, password=POSTGRES_PASSWORD,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT time, "{MINDERGAS_GAS_FIELD}" FROM {MINDERGAS_GAS_TABLE} '
+                f"WHERE time >= %s AND time < %s ORDER BY time DESC LIMIT 1",
+                (window_start, window_end),
+            )
+            return cur.fetchone()
 
 
 def publish_mqtt(mqtt_client, values):
@@ -479,28 +531,23 @@ def push_pvoutput(values):
 def push_mindergas():
     # Mirrors DSMR-reader's own exporter (src/dsmr_mindergas/services.py): take the last gas
     # reading in the 3 hours before local midnight -- i.e. the previous day's final reading --
-    # and POST {"date": <that day>, "reading": "<m3>"}. The value is read back out of InfluxDB
-    # (written there by DSMR-reader's InfluxDB export) rather than DSMR-reader's own database.
+    # and POST {"date": <that day>, "reading": "<m3>"}. The value is read back out of the
+    # gas_positions table this container itself writes from DSMR_TOPIC_GAS.
     #
-    # Timestamps must be timezone-aware: InfluxDB stores UTC and reads a naive string as UTC,
-    # so passing naive local time here would shift the window by the local UTC offset.
+    # Timestamps must be timezone-aware: Postgres stores timestamptz as UTC and reads a naive
+    # value as the session's local time, so passing naive local time here would be ambiguous.
     now_local = datetime.now().astimezone()
     midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     window_start = midnight - timedelta(hours=3)
 
-    sql = (
-        f'SELECT time, "{MINDERGAS_GAS_FIELD}" FROM "{MINDERGAS_GAS_MEASUREMENT}" '
-        f"WHERE time >= '{window_start.isoformat()}' AND time < '{midnight.isoformat()}' "
-        f"ORDER BY time DESC LIMIT 1"
-    )
-    rows = query_influxdb_sql(sql)
-    if not rows:
+    row = get_last_gas_reading(window_start, midnight)
+    if row is None:
         raise AssertionError(
-            f"No gas reading found in InfluxDB between {window_start.isoformat()} and "
-            f"{midnight.isoformat()} -- is DSMR-reader's InfluxDB export enabled?"
+            f"No gas reading found between {window_start.isoformat()} and {midnight.isoformat()} "
+            f"-- is ENABLE_DSMR on and is the gas topic publishing?"
         )
 
-    reading = rows[0][MINDERGAS_GAS_FIELD]
+    _reading_time, reading = row
     payload = {"date": (midnight - timedelta(days=1)).date().isoformat(), "reading": str(reading)}
 
     if not ENABLE_MINDERGAS:
@@ -522,8 +569,8 @@ def parse_timestamp_ns(raw):
     """ISO 8601 string -> epoch nanoseconds, or None if it isn't one.
 
     A naive value is read as local time, matching how DSMR-reader renders timestamps when its
-    Django timezone is set; InfluxDB stores UTC, so the offset has to be resolved here rather than
-    left implicit.
+    Django timezone is set; Postgres stores timestamptz as UTC, so the offset has to be resolved
+    here rather than left implicit.
     """
     if not isinstance(raw, str):
         return None
@@ -537,11 +584,11 @@ def parse_timestamp_ns(raw):
 
 
 def dsmr_topic_map():
-    """Subscribed topic -> (cache key, InfluxDB measurement)."""
+    """Subscribed topic -> (cache key, Postgres table)."""
     return {
-        DSMR_TOPIC_ELEC: ("elec", DSMR_ELEC_MEASUREMENT),
-        DSMR_TOPIC_GAS: ("gas", DSMR_GAS_MEASUREMENT),
-        DSMR_TOPIC_DAY: ("day", DSMR_DAY_MEASUREMENT),
+        DSMR_TOPIC_ELEC: ("elec", DSMR_ELEC_TABLE),
+        DSMR_TOPIC_GAS: ("gas", DSMR_GAS_TABLE),
+        DSMR_TOPIC_DAY: ("day", DSMR_DAY_TABLE),
     }
 
 
@@ -563,10 +610,11 @@ def _on_mqtt_message(client, userdata, message):
 
 
 def _handle_dsmr_message(message, entry):
-    key, measurement = entry
+    key, table = entry
     try:
         # DSMR-reader publishes every value as a JSON string, so coerce to float here and drop
-        # anything non-numeric rather than letting it reach InfluxDB as a string field.
+        # anything non-numeric rather than letting it reach Postgres as a value for a
+        # double-precision column.
         payload = json.loads(message.payload.decode("utf-8"))
         values, ts_ns = {}, None
         for field, raw in payload.items():
@@ -608,7 +656,7 @@ def _handle_dsmr_message(message, entry):
     if ts_ns is not None:
         _dsmr_last_written[key] = (ts_ns, dict(values))
 
-    queue_write(values, ts_ns if ts_ns is not None else time.time_ns(), measurement, "dsmr")
+    queue_write(values, ts_ns if ts_ns is not None else time.time_ns(), table, "dsmr")
 
 
 def _handle_plug_message(message, label):
@@ -640,7 +688,7 @@ def _handle_plug_message(message, label):
         return
     _plug_last_write_time[label] = now
 
-    queue_write(values, time.time_ns(), PLUG_MEASUREMENT, label)
+    queue_write(values, time.time_ns(), PLUG_TABLE, label)
 
 
 def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
@@ -669,7 +717,7 @@ def mqtt_connect():
     """Starts an MQTT client that connects in the background.
 
     connect_async means a broker that's down at startup (or restarted later) never takes the
-    inverter polling or InfluxDB writes down with it -- paho retries on its own network thread,
+    inverter polling or Postgres writes down with it -- paho retries on its own network thread,
     and publishes while disconnected are dropped rather than raising.
     """
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
@@ -724,9 +772,9 @@ def derived_fields(values, dsmr_values):
     return fields
 
 
-def queue_write(values, ts_ns, measurement, source):
+def queue_write(values, ts_ns, table, source):
     """Hands a point to the writer thread, dropping the oldest if the queue is saturated."""
-    item = (dict(values), ts_ns, measurement, source)
+    item = (dict(values), ts_ns, table, source)
     try:
         _write_queue.put_nowait(item)
         return
@@ -736,26 +784,25 @@ def queue_write(values, ts_ns, measurement, source):
         _write_queue.get_nowait()
     except queue.Empty:
         pass
-    log.warning("InfluxDB write queue full; dropped the oldest queued point")
+    log.warning("Postgres write queue full; dropped the oldest queued point")
     try:
         _write_queue.put_nowait(item)
     except queue.Full:
         pass
 
 
-def influx_writer_loop():
+def pg_writer_loop():
     """Drains _write_queue.
 
-    Every InfluxDB write goes through here so no producer ever blocks on it. That matters more than
-    it sounds: a write takes ~500ms against a local InfluxDB 3, which would otherwise stretch the
-    poll interval and stall paho's network thread.
+    Every Postgres write goes through here so no producer ever blocks on it. A write is a network
+    round trip, which would otherwise stretch the poll interval and stall paho's network thread.
     """
     while True:
-        values, ts_ns, measurement, source = _write_queue.get()
+        values, ts_ns, table, source = _write_queue.get()
         try:
-            write_influxdb(values, ts_ns, measurement=measurement, source=source)
+            write_postgres(values, ts_ns, table=table, source=source)
         except Exception:
-            log.exception("InfluxDB write failed for %s", measurement)
+            log.exception("Postgres write failed for %s", table)
 
 
 def pvoutput_loop():
@@ -884,7 +931,7 @@ def main():
     mqtt_client = mqtt_connect()
 
     threading.Thread(target=mqtt_watchdog_loop, args=(mqtt_client,), daemon=True).start()
-    threading.Thread(target=influx_writer_loop, daemon=True).start()
+    threading.Thread(target=pg_writer_loop, daemon=True).start()
     threading.Thread(target=pvoutput_loop, daemon=True).start()
     threading.Thread(target=mindergas_loop, daemon=True).start()
 
@@ -909,16 +956,16 @@ def main():
                 values["internal_temperature"],
             )
 
-            # Each sink is independent: an InfluxDB outage must not stop MQTT updates (the
-            # physical display reads those) and vice versa. The InfluxDB write is queued rather
+            # Each sink is independent: a Postgres outage must not stop MQTT updates (the
+            # physical display reads those) and vice versa. The Postgres write is queued rather
             # than performed here, so its latency never stretches the poll interval.
-            queue_write(values, ts_ns, INFLUXDB_MEASUREMENT, "sungrow")
+            queue_write(values, ts_ns, POSTGRES_TABLE, "sungrow")
             if ENABLE_DERIVED:
                 try:
                     queue_write(
                         derived_fields(values, get_dsmr_values() if ENABLE_DSMR else {}),
                         ts_ns,
-                        DERIVED_MEASUREMENT,
+                        DERIVED_TABLE,
                         "derived",
                     )
                 except Exception:

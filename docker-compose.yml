@@ -7,9 +7,10 @@ services:
       - INVERTER_HOST=192.168.1.50
       - INVERTER_PORT=502
       - SCAN_INTERVAL=15
-      - INFLUXDB_URL=http://influxdb:8181
-      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
-      - INFLUXDB_DATABASE=energy
+      - POSTGRES_HOST=timescaledb
+      - POSTGRES_DB=energy
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       # Broker used both to publish solar values and to consume DSMR-reader's exports
       - MQTT_HOST=192.168.1.10
       - MQTT_USERNAME=${MQTT_USERNAME}

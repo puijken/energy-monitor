@@ -7,13 +7,17 @@ dropped the `slave` keyword in favour of `device_id`).
 
 Originally this only covered pymodbus (start an in-process Modbus server, poll it through
 app.poll_inverter, check the decoded values). Dependabot auto-merges non-major bumps to
-paho-mqtt and requests too, so an API change in either would also pass CI and only surface at
-runtime. This file now additionally covers, all without a real broker or InfluxDB:
+paho-mqtt, requests and psycopg too, so an API change in any of them would also pass CI and only
+surface at runtime. This file now additionally covers, all without a real broker or Postgres:
 
   - paho-mqtt: app.mqtt_connect() still returns a working client (catches a Client()/
     callback_api_version constructor change).
-  - requests + the InfluxDB write path: app.write_influxdb() posts the expected path, query
-    string, auth header and line-protocol body to a throwaway local http.server.
+  - psycopg + the Postgres write path: app.write_postgres() executes the expected SQL/params
+    against a fake capturing connection/cursor (no real database needed) -- catching both a
+    psycopg API change and a regression in the write path itself (wrong table, wrong ON
+    CONFLICT clause, a known column routed into `extra` or vice versa).
+  - psycopg + the Postgres read path: app.get_last_gas_reading() likewise, against a fake
+    connection that returns a canned row.
   - DSMR MQTT message handling: app._on_mqtt_message() against real captured DSMR-reader
     payloads, checking string->float coercion, timestamp-field consumption, throttling and what
     ends up on the write queue.
@@ -35,15 +39,14 @@ import signal
 import sys
 import threading
 import time
-import urllib.parse
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from queue import Empty
 
 os.environ.setdefault("INVERTER_HOST", "127.0.0.1")
 os.environ.setdefault("INVERTER_PORT", "15020")
-os.environ.setdefault("INFLUXDB_URL", "http://127.0.0.1:1")
-os.environ.setdefault("INFLUXDB_TOKEN", "smoke")
+os.environ.setdefault("POSTGRES_HOST", "127.0.0.1")
+os.environ.setdefault("POSTGRES_USER", "smoke")
+os.environ.setdefault("POSTGRES_PASSWORD", "smoke")
 os.environ.setdefault("MQTT_HOST", "127.0.0.1")
 
 from pymodbus.datastore import ModbusSequentialDataBlock, ModbusServerContext  # noqa: E402
@@ -167,13 +170,6 @@ def check_modbus_poll(failures):
     if abs(ac_from_vi - ac) / ac > 0.05:
         failures.append(f"  phase A V*I {ac_from_vi:.0f}W disagrees with active power {ac}W by >5%")
 
-    # Line protocol must stay parseable and consistently typed.
-    line = app.line_protocol_field("total_active_power", ac)
-    if line != "total_active_power=2888.0":
-        failures.append(f"  numeric line protocol changed: {line}")
-    if app.line_protocol_field("run_state", "ON") != 'run_state="ON"':
-        failures.append("  string line protocol is not quoted")
-
     print(f"  modbus poll: {len(EXPECTED)} values decoded, unit kwarg={app._UNIT_KWARG!r}")
 
 
@@ -216,100 +212,140 @@ def check_mqtt_connect(failures):
             pass
 
 
-class _CapturingHandler(BaseHTTPRequestHandler):
-    """Records a single POST's path/query/headers/body, then answers 200 OK."""
+class _FakeCursor:
+    """Records execute() calls and returns a canned row from fetchone(), standing in for a real
+    psycopg cursor. Supports the `with conn.cursor() as cur:` pattern app.py uses."""
 
-    captured = None
+    def __init__(self, fetch_result=None):
+        self.executed = []
+        self._fetch_result = fetch_result
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8")
-        path, _, query = self.path.partition("?")
-        _CapturingHandler.captured = {
-            "path": path,
-            "query": query,
-            "headers": dict(self.headers),
-            "body": body,
-        }
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"{}")
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
 
-    def log_message(self, fmt, *args):  # keep test output quiet
-        pass
+    def fetchone(self):
+        return self._fetch_result
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
 
 
-def check_influxdb_write(failures):
-    """requests + write_influxdb() coverage.
+class _FakeConnection:
+    """Stands in for a real psycopg connection -- one cursor, remembered so a test can inspect
+    what was executed. Supports `with psycopg.connect(...) as conn:` and being assigned directly
+    to app._pg_conn (app's own persistent-connection slot)."""
 
-    Runs a throwaway local HTTP server instead of a real InfluxDB, points app.INFLUXDB_URL at it,
-    and inspects exactly what app.write_influxdb() sent -- catching both a requests API change and
-    a regression in the write path itself (wrong endpoint, wrong query params, wrong auth header,
-    malformed line protocol).
+    closed = False
+
+    def __init__(self, fetch_result=None):
+        self.cursor_obj = _FakeCursor(fetch_result)
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def check_postgres_write(failures):
+    """psycopg + write_postgres() coverage against a fake connection/cursor -- no real Postgres
+    needed. Checks the INSERT statement, its ON CONFLICT clause, and that a field not in
+    TABLE_COLUMNS is routed into `extra` instead of becoming its own column (or failing outright).
     """
     before = len(failures)
-    _CapturingHandler.captured = None
-    server = HTTPServer(("127.0.0.1", 0), _CapturingHandler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.handle_request, daemon=True)
-    thread.start()
-
-    orig_url, orig_token = app.INFLUXDB_URL, app.INFLUXDB_TOKEN
-    app.INFLUXDB_URL = f"http://127.0.0.1:{port}"
-    app.INFLUXDB_TOKEN = "test-token-abc"
+    orig_conn = app._pg_conn
+    fake_conn = _FakeConnection()
+    app._pg_conn = fake_conn
     ts_ns = 1732900000123456789
     try:
-        app.write_influxdb(
-            {"total_active_power": 2888.0, "run_state": "ON"},
+        app.write_postgres(
+            {"total_active_power": 2888.0, "run_state": "ON", "not_a_real_column": 1.5},
             ts_ns,
-            measurement="solar_test",
+            table=app.POSTGRES_TABLE,
             source="sungrow_test",
         )
     except Exception as exc:
-        failures.append(f"  app.write_influxdb() raised {exc!r}")
+        failures.append(f"  app.write_postgres() raised {exc!r}")
+        app._pg_conn = orig_conn
+        return
     finally:
-        app.INFLUXDB_URL, app.INFLUXDB_TOKEN = orig_url, orig_token
-        thread.join(timeout=5)
+        app._pg_conn = orig_conn
 
-    captured = _CapturingHandler.captured
-    if captured is None:
-        failures.append("  write_influxdb() never reached the test HTTP server")
+    executed = fake_conn.cursor_obj.executed
+    if not executed:
+        failures.append("  write_postgres() never executed a query")
         return
 
-    if captured["path"] != "/api/v3/write_lp":
-        failures.append(f"  write path: expected '/api/v3/write_lp', got {captured['path']!r}")
+    sql, params = executed[0]
+    if app.POSTGRES_TABLE not in sql:
+        failures.append(f"  write_postgres() SQL doesn't reference the table: {sql!r}")
+    if "ON CONFLICT (time, source) DO UPDATE" not in sql:
+        failures.append(f"  write_postgres() SQL missing expected ON CONFLICT clause: {sql!r}")
 
-    qs = urllib.parse.parse_qs(captured["query"])
-    if qs.get("db") != [app.INFLUXDB_DATABASE]:
-        failures.append(f"  query 'db': expected {[app.INFLUXDB_DATABASE]!r}, got {qs.get('db')!r}")
-    if qs.get("precision") != ["nanosecond"]:
-        failures.append(f"  query 'precision': expected ['nanosecond'], got {qs.get('precision')!r}")
-
-    auth = captured["headers"].get("Authorization")
-    if auth != "Bearer test-token-abc":
-        failures.append(f"  Authorization header: expected 'Bearer test-token-abc', got {auth!r}")
-
-    tokens = captured["body"].split(" ")
-    if len(tokens) != 3:
-        failures.append(f"  line protocol body has unexpected shape: {captured['body']!r}")
-    else:
-        measurement_tags, fields_part, ts_part = tokens
-        if measurement_tags != "solar_test,source=sungrow_test":
-            failures.append(
-                f"  line protocol measurement/tags: expected 'solar_test,source=sungrow_test', "
-                f"got {measurement_tags!r}"
-            )
-        expected_fields = (
-            f"{app.line_protocol_field('total_active_power', 2888.0)},"
-            f"{app.line_protocol_field('run_state', 'ON')}"
+    expected_ts = datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=timezone.utc)
+    if len(params) < 3 or params[0] != expected_ts or params[1] != "sungrow_test":
+        failures.append(
+            f"  write_postgres() time/source params: expected [{expected_ts!r}, 'sungrow_test', ...], "
+            f"got {params!r}"
         )
-        if fields_part != expected_fields:
-            failures.append(f"  line protocol fields: expected {expected_fields!r}, got {fields_part!r}")
-        if ts_part != str(ts_ns):
-            failures.append(f"  line protocol timestamp: expected {ts_ns}, got {ts_part!r}")
+
+    # "not_a_real_column" isn't in TABLE_COLUMNS[POSTGRES_TABLE] -- it must land in the `extra`
+    # JSONB param rather than becoming its own column, while the two known fields stay direct
+    # params in the order they were given.
+    extra_param = params[2] if len(params) > 2 else None
+    if extra_param is None or json.loads(extra_param) != {"not_a_real_column": 1.5}:
+        failures.append(
+            f"  write_postgres() extra param: expected '{{\"not_a_real_column\": 1.5}}', got {extra_param!r}"
+        )
+    if params[3:] != [2888.0, "ON"]:
+        failures.append(f"  write_postgres() known-column params: expected [2888.0, 'ON'], got {params[3:]!r}")
 
     if len(failures) == before:
-        print("  influxdb write: path/query/auth/body all as expected")
+        print("  postgres write: SQL/ON CONFLICT/params as expected, unmapped field routed into `extra`")
+
+
+def check_get_last_gas_reading(failures):
+    """psycopg + get_last_gas_reading() coverage.
+
+    Monkeypatches psycopg.connect() (this function opens its own short-lived connection rather
+    than sharing the writer thread's persistent one) to return a fake connection with a canned
+    row, and checks the query references the right table and binds the window as parameters
+    rather than interpolating them into the SQL string.
+    """
+    before = len(failures)
+    canned_row = (datetime(2026, 7, 31, 23, 50, tzinfo=timezone.utc), 6573.284)
+    fake_conn = _FakeConnection(fetch_result=canned_row)
+    orig_connect = app.psycopg.connect
+    app.psycopg.connect = lambda **kwargs: fake_conn
+    window_start = datetime(2026, 7, 31, 21, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+    try:
+        result = app.get_last_gas_reading(window_start, window_end)
+    except Exception as exc:
+        failures.append(f"  app.get_last_gas_reading() raised {exc!r}")
+        return
+    finally:
+        app.psycopg.connect = orig_connect
+
+    if result != canned_row:
+        failures.append(f"  get_last_gas_reading() return: expected {canned_row}, got {result!r}")
+
+    sql, params = fake_conn.cursor_obj.executed[0]
+    if app.MINDERGAS_GAS_TABLE not in sql:
+        failures.append(f"  get_last_gas_reading() SQL doesn't reference {app.MINDERGAS_GAS_TABLE!r}: {sql!r}")
+    if params != (window_start, window_end):
+        failures.append(
+            f"  get_last_gas_reading() params: expected {(window_start, window_end)!r}, got {params!r}"
+        )
+
+    if len(failures) == before:
+        print("  postgres read (get_last_gas_reading): SQL/params/return value as expected")
 
 
 class _StubMessage:
@@ -325,7 +361,7 @@ def check_dsmr_mqtt_message(failures):
 
     Exercises app._on_mqtt_message() end to end: JSON-string -> float coercion, the timestamp
     field (read_at) being consumed rather than stored as a value, per-source throttling, and what
-    lands on the InfluxDB write queue.
+    lands on the Postgres write queue.
     """
     before = len(failures)
     orig_min_interval = app.DSMR_MIN_INTERVAL
@@ -382,15 +418,15 @@ def check_dsmr_mqtt_message(failures):
             except Empty:
                 break
 
-        elec_item = next((it for it in queued if it[2] == app.DSMR_ELEC_MEASUREMENT), None)
-        gas_item = next((it for it in queued if it[2] == app.DSMR_GAS_MEASUREMENT), None)
+        elec_item = next((it for it in queued if it[2] == app.DSMR_ELEC_TABLE), None)
+        gas_item = next((it for it in queued if it[2] == app.DSMR_GAS_TABLE), None)
 
         if elec_item is None:
             failures.append(
-                f"  no point enqueued for elec measurement {app.DSMR_ELEC_MEASUREMENT!r}; queued={queued}"
+                f"  no point enqueued for elec table {app.DSMR_ELEC_TABLE!r}; queued={queued}"
             )
         else:
-            elec_values, _elec_ts_ns, _elec_measurement, elec_source = elec_item
+            elec_values, _elec_ts_ns, _elec_table, elec_source = elec_item
             if elec_values != expected_elec:
                 failures.append(f"  queued elec point values: expected {expected_elec}, got {elec_values}")
             if elec_source != "dsmr":
@@ -398,10 +434,10 @@ def check_dsmr_mqtt_message(failures):
 
         if gas_item is None:
             failures.append(
-                f"  no point enqueued for gas measurement {app.DSMR_GAS_MEASUREMENT!r}; queued={queued}"
+                f"  no point enqueued for gas table {app.DSMR_GAS_TABLE!r}; queued={queued}"
             )
         else:
-            gas_values, gas_ts_ns, _gas_measurement, gas_source = gas_item
+            gas_values, gas_ts_ns, _gas_table, gas_source = gas_item
             expected_gas_ts_ns = int(datetime(2026, 7, 29, 9, 45, 4, tzinfo=timezone.utc).timestamp() * 1_000_000_000)
             if "read_at" in gas_values:
                 failures.append(f"  queued gas point still has 'read_at' as a field: {gas_values}")
@@ -434,7 +470,7 @@ def check_plug_mqtt_message(failures):
     """Smart-plug MQTT message parsing, using real captured Zigbee2MQTT payloads.
 
     Exercises app._on_mqtt_message() end to end for the plug topic path: only the common
-    power/energy/current/voltage/state fields end up queued for InfluxDB, per-model extras
+    power/energy/current/voltage/state fields end up queued for Postgres, per-model extras
     (auto_off, device_temperature, indicator_mode, ...) are dropped, and an unconfigured topic is
     silently ignored rather than raising or getting queued.
     """
@@ -493,18 +529,18 @@ def check_plug_mqtt_message(failures):
         if server_item is None:
             failures.append(f"  no point enqueued for plug label 'server'; queued={queued}")
         else:
-            values, _ts_ns, measurement, _source = server_item
+            values, _ts_ns, table, _source = server_item
             if values != expected_server:
                 failures.append(f"  queued server-plug point: expected {expected_server}, got {values}")
-            if measurement != app.PLUG_MEASUREMENT:
+            if table != app.PLUG_TABLE:
                 failures.append(
-                    f"  queued server-plug measurement: expected {app.PLUG_MEASUREMENT!r}, got {measurement!r}"
+                    f"  queued server-plug table: expected {app.PLUG_TABLE!r}, got {table!r}"
                 )
 
         if tv_item is None:
             failures.append(f"  no point enqueued for plug label 'tv'; queued={queued}")
         else:
-            values, _ts_ns, _measurement, _source = tv_item
+            values, _ts_ns, _table, _source = tv_item
             if values != expected_tv:
                 failures.append(f"  queued tv-plug point: expected {expected_tv}, got {values}")
 
@@ -713,7 +749,8 @@ def main():
     failures = []
     check_modbus_poll(failures)
     check_mqtt_connect(failures)
-    check_influxdb_write(failures)
+    check_postgres_write(failures)
+    check_get_last_gas_reading(failures)
     check_dsmr_mqtt_message(failures)
     check_plug_mqtt_message(failures)
     check_parse_timestamp_ns(failures)
@@ -728,8 +765,8 @@ def main():
         print("\n".join(failures), file=sys.stderr)
         return 1
 
-    print("smoke test passed: modbus, mqtt connect, influxdb write, dsmr parsing, plug parsing, "
-          "timestamps, pvoutput metrics, derived fields, log level")
+    print("smoke test passed: modbus, mqtt connect, postgres write, postgres read, dsmr parsing, "
+          "plug parsing, timestamps, pvoutput metrics, derived fields, log level")
     return 0
 
 

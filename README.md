@@ -1,9 +1,10 @@
 # Energy Monitor
 
-Collects whole-house energy data into one InfluxDB: solar generation read from a Sungrow inverter
-over Modbus TCP, and electricity/gas consumption taken from DSMR-reader's MQTT export. Publishes
-solar values to MQTT, and optionally uploads to PVOutput (every few minutes) and Mindergas (once
-daily). Built as a self-maintained replacement for the third-party `bohdans/sungather` image.
+Collects whole-house energy data into one TimescaleDB (Postgres): solar generation read from a
+Sungrow inverter over Modbus TCP, and electricity/gas consumption taken from DSMR-reader's MQTT
+export. Publishes solar values to MQTT, and optionally uploads to PVOutput (every few minutes) and
+Mindergas (once daily). Built as a self-maintained replacement for the third-party
+`bohdans/sungather` image.
 
 ## Features
 
@@ -11,16 +12,18 @@ daily). Built as a self-maintained replacement for the third-party `bohdans/sung
   registers): generation power, daily and lifetime yield, DC/MPPT voltage & current, phase voltage,
   internal temperature.
 - Subscribes to DSMR-reader's JSON MQTT topics for smart-meter electricity and gas readings, and
-  writes those to InfluxDB too — so one database holds generation *and* consumption.
-- Writes every reading to InfluxDB 3 as line protocol (`solar` measurement, `source=sungrow` tag;
-  smart-meter data under `electricity` / `gas_positions` / `electricity_day_totals` with
-  `source=dsmr`).
+  writes those to the same database too — so one place holds generation *and* consumption.
+- Writes every reading to TimescaleDB (`solar` table, `source=sungrow`; smart-meter data under
+  `electricity` / `gas_positions` / `electricity_day_totals` with `source=dsmr`). Fields not in a
+  table's fixed columns land in an `extra` JSONB column instead of failing the write, so enabling
+  a new DSMR/plug field needs no code change here — see [Smart plugs](#smart-plugs-zigbee2mqtt)
+  for what that keeps schemaless.
 - Publishes the same values to MQTT, one topic per field under `MQTT_TOPIC_PREFIX`.
 - Optionally pushes a status update to PVOutput on an interval (gated by `ENABLE_PVOUTPUT`,
   default off).
 - Optionally pushes the previous day's cumulative gas meter reading to Mindergas shortly after
-  midnight (gated by `ENABLE_MINDERGAS`, default off), reading the value back out of InfluxDB —
-  requires DSMR-reader's own InfluxDB export to be enabled and writing into the same database.
+  midnight (gated by `ENABLE_MINDERGAS`, default off), reading the value back out of the
+  `gas_positions` table this container itself writes.
 
 Both external-upload flags default to `false` so this can run safely alongside an existing
 uploader (e.g. `sungrow_monitor`/DSMR-reader) without double-reporting, until you're ready to cut
@@ -35,10 +38,12 @@ over.
 | `INVERTER_PORT` | `502` | Modbus TCP port |
 | `INVERTER_SLAVE_ID` | `1` | Modbus slave/unit ID |
 | `SCAN_INTERVAL` | `15` | Seconds between inverter polls |
-| `INFLUXDB_URL` | *required* | Base URL of InfluxDB 3, e.g. `http://influxdb:8181` |
-| `INFLUXDB_TOKEN` | *required* | InfluxDB auth token |
-| `INFLUXDB_DATABASE` | `energy` | InfluxDB 3 database name |
-| `INFLUXDB_MEASUREMENT` | `solar` | Measurement name written to |
+| `POSTGRES_HOST` | *required* | TimescaleDB/Postgres hostname, e.g. `timescaledb` |
+| `POSTGRES_PORT` | `5432` | Postgres port |
+| `POSTGRES_DB` | `energy` | Database name |
+| `POSTGRES_USER` | *required* | Database user |
+| `POSTGRES_PASSWORD` | *required* | Database password |
+| `POSTGRES_TABLE` | `solar` | Table name written to for inverter readings |
 | `MQTT_HOST` | *required* | MQTT broker hostname/IP |
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USERNAME` | *(none)* | MQTT username, if required |
@@ -49,14 +54,14 @@ over.
 | `DSMR_TOPIC_ELEC` | `dsmr/json/elec` | DSMR-reader JSON telegram topic |
 | `DSMR_TOPIC_GAS` | `dsmr/json/gas` | DSMR-reader JSON gas consumption topic |
 | `DSMR_TOPIC_DAY` | `dsmr/day-consumption` | DSMR-reader JSON day totals topic |
-| `DSMR_ELEC_MEASUREMENT` | `electricity` | InfluxDB measurement for the electricity telegram |
-| `DSMR_GAS_MEASUREMENT` | `gas_positions` | InfluxDB measurement for gas readings |
-| `DSMR_DAY_MEASUREMENT` | `electricity_day_totals` | InfluxDB measurement for day totals |
+| `DSMR_ELEC_TABLE` | `electricity` | Table for the electricity telegram |
+| `DSMR_GAS_TABLE` | `gas_positions` | Table for gas readings |
+| `DSMR_DAY_TABLE` | `electricity_day_totals` | Table for day totals |
 | `DSMR_MAX_DATA_AGE` | `300` | Cached meter values older than this count as absent |
 | `ENABLE_PLUGS` | `false` | Subscribe to configured Zigbee2MQTT smart-plug topics for per-circuit submetering. See [Smart plugs](#smart-plugs-zigbee2mqtt). |
-| `PLUG_TOPICS` | *(none)* | Comma-separated `topic=label` pairs, e.g. `zigbee2mqtt/Plug A=server,zigbee2mqtt/Plug B=airco`. The label becomes the InfluxDB tag value. |
-| `PLUG_MEASUREMENT` | `smart_plugs` | InfluxDB measurement written to |
-| `PLUG_MIN_INTERVAL` | `5` | Minimum seconds between InfluxDB writes per plug |
+| `PLUG_TOPICS` | *(none)* | Comma-separated `topic=label` pairs, e.g. `zigbee2mqtt/Plug A=server,zigbee2mqtt/Plug B=airco`. The label becomes the `source` column value. |
+| `PLUG_TABLE` | `smart_plugs` | Table written to |
+| `PLUG_MIN_INTERVAL` | `5` | Minimum seconds between Postgres writes per plug |
 | `ENABLE_PVOUTPUT` | `false` | When `false`, logs what would be sent instead of posting |
 | `PVOUTPUT_API_KEY` | *(none)* | Required if `ENABLE_PVOUTPUT=true` |
 | `PVOUTPUT_SYSTEM_ID` | *(none)* | Required if `ENABLE_PVOUTPUT=true` |
@@ -68,8 +73,8 @@ over.
 | `MINDERGAS_API_KEY` | *(none)* | Required if `ENABLE_MINDERGAS=true` |
 | `MINDERGAS_HOUR` / `MINDERGAS_MINUTE` | `0` / `5` | Local time-of-day the daily Mindergas push fires |
 | `MINDERGAS_RETRY_INTERVAL` | `900` | Seconds to wait before retrying a failed daily push (retries stay within `MINDERGAS_HOUR`) |
-| `MINDERGAS_GAS_MEASUREMENT` | `gas_positions` | InfluxDB measurement DSMR-reader writes gas readings to |
-| `MINDERGAS_GAS_FIELD` | `delivered` | Field name within that measurement |
+| `MINDERGAS_GAS_TABLE` | `gas_positions` | Table this container's own DSMR ingestion writes gas readings to |
+| `MINDERGAS_GAS_FIELD` | `delivered` | Column name within that table |
 | `TZ` | *(container default)* | Timezone for scheduling/logging |
 
 ## Log levels
@@ -114,14 +119,14 @@ Electricity and gas come from **DSMR-reader's own MQTT export**, not from its da
 InfluxDB export. Enable the JSON exports in DSMR-reader's admin UI (Configuration → MQTT) pointing
 at the same broker this container uses, and set the topics here to match:
 
-| Source key | Variable | DSMR-reader export | Written to measurement |
+| Source key | Variable | DSMR-reader export | Written to table |
 |---|---|---|---|
-| `elec` | `DSMR_TOPIC_ELEC` | JSON telegram | `DSMR_ELEC_MEASUREMENT` (`electricity`) |
-| `gas` | `DSMR_TOPIC_GAS` | JSON gas consumption | `DSMR_GAS_MEASUREMENT` (`gas_positions`) |
-| `day` | `DSMR_TOPIC_DAY` | JSON day totals | `DSMR_DAY_MEASUREMENT` (`electricity_day_totals`) |
+| `elec` | `DSMR_TOPIC_ELEC` | JSON telegram | `DSMR_ELEC_TABLE` (`electricity`) |
+| `gas` | `DSMR_TOPIC_GAS` | JSON gas consumption | `DSMR_GAS_TABLE` (`gas_positions`) |
+| `day` | `DSMR_TOPIC_DAY` | JSON day totals | `DSMR_DAY_TABLE` (`electricity_day_totals`) |
 
 Each message is parsed, coerced to numbers (DSMR-reader publishes every value as a JSON string),
-cached in memory for the PVOutput metrics, and written to InfluxDB. Non-numeric fields are skipped
+cached in memory for the PVOutput metrics, and written to Postgres. Non-numeric fields are skipped
 rather than written as strings. Subscriptions are re-established on every reconnect, so a broker
 restart doesn't silently leave the container deaf.
 
@@ -139,8 +144,8 @@ Why MQTT and not the alternatives:
 
 Optionally submeters individual circuits from metering Zigbee smart plugs published by
 Zigbee2MQTT onto the same broker DSMR uses. Enable with `ENABLE_PLUGS=true` and list the topics
-to subscribe to in `PLUG_TOPICS` as `topic=label` pairs; each label becomes the `source` tag value
-in `PLUG_MEASUREMENT` (default `smart_plugs`).
+to subscribe to in `PLUG_TOPICS` as `topic=label` pairs; each label becomes the `source` column
+value in `PLUG_TABLE` (default `smart_plugs`).
 
 Unlike DSMR there is no fixed schema to map: different plug models publish different extra
 fields (e.g. an Aqara plug's `device_temperature`/`power_outage_count` vs. a Tuya plug's
@@ -187,7 +192,7 @@ The defaults reproduce exactly what the previous SunGather setup sent:
 
 Metrics sourced from the **meter** read the cached MQTT payloads described in
 [Smart-meter data](#smart-meter-data) — `elec` means `DSMR_TOPIC_ELEC`, `day` means
-`DSMR_TOPIC_DAY`. No InfluxDB query is involved, so these stay usable even while InfluxDB writes
+`DSMR_TOPIC_DAY`. No Postgres query is involved, so these stay usable even while Postgres writes
 are failing.
 
 If a required payload hasn't arrived, or is older than `DSMR_MAX_DATA_AGE`, the parameters needing
@@ -222,14 +227,13 @@ picks the last gas reading timestamped in the 3 hours before local midnight (i.e
 day's final reading) and POSTs `{"date": <that day>, "reading": "<m3>"}` to
 `https://www.mindergas.nl/api/meter_readings` with an `AUTH-TOKEN` header.
 
-Unlike the PVOutput metrics this reads from **InfluxDB**, not the MQTT cache — it needs the value as
+Unlike the PVOutput metrics this reads from **Postgres**, not the MQTT cache — it needs the value as
 it stood before midnight, which requires timestamped history rather than the latest value. It reads
-the gas data this container itself wrote (`MINDERGAS_GAS_MEASUREMENT` defaults to
-`DSMR_GAS_MEASUREMENT`), so the two stay consistent automatically.
+the gas data this container itself wrote (`MINDERGAS_GAS_TABLE` defaults to `DSMR_GAS_TABLE`), so
+the two stay consistent automatically.
 
-Timestamps are timezone-aware on purpose: InfluxDB stores UTC and interprets a naive string as UTC,
-so passing naive local time would shift the window by the local offset and select the wrong day's
-reading.
+Timestamps are timezone-aware on purpose: Postgres stores `timestamptz` as UTC and interprets a
+naive value as the session's local time, so passing naive local time here would be ambiguous.
 
 ## Tests
 
@@ -257,4 +261,4 @@ the published image.
 
 See `docker-compose.yml` in this repo for a usage example. A typical deployment has this
 container is one service alongside the TimescaleDB instance it writes to,
-alongside the InfluxDB and Grafana instances it feeds.
+alongside the TimescaleDB and Grafana instances it feeds.
