@@ -80,6 +80,7 @@ RAW = {
     5021: 122,      # phase_a_current      S16 x0.1 -> 12.2 A
     5030: 2888,     # total_active_power   U32 low
     5031: 0,        #                      U32 high -> 2888 W
+    5037: 0x0000,   # work_state_1         U16 -> 0x0000 "Run"
 }
 EXPECTED = {
     "daily_power_yields": 8.3,
@@ -95,7 +96,7 @@ EXPECTED = {
     "phase_a_voltage": 237.8,
     "phase_a_current": 12.2,
     "total_active_power": 2888,
-    "run_state": "ON",
+    "run_state": "Run",
 }
 
 

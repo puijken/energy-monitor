@@ -110,8 +110,12 @@ interoperability, not vendored code. See `REGISTERS` in `app.py` for the exact a
 Addresses there are 1-based protocol register numbers; Modbus reads are 0-based, hence the `-1`
 in `poll_inverter`. All registers are read in a single input-register (function code 4) request.
 
-This inverter family exposes no `run_state`/`system_state` register, so `run_state` is derived
-from whether `total_active_power > 0`.
+`run_state` is decoded from the real `work_state_1` register (address 5038, outside the main block
+but still within one Modbus read) via `WORK_STATES` in `app.py` — `Run`, `Stop`, `Standby`, `Fault`,
+etc. An earlier assumption that this inverter family exposed no run/system-state register (that
+block being hybrid-only in Sungrow's protocol) turned out to be wrong; it was derived from
+`total_active_power > 0` instead until this was corrected. An unmapped code is logged as
+`Unknown (0x....)` rather than silently dropped, so a new one shows up rather than going missing.
 
 Values were validated against the real inverter: MPPT1 + MPPT2 DC power sums to `total_dc_power`,
 and `total_active_power` (AC) sits just below it with a realistic conversion loss.

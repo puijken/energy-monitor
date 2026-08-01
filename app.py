@@ -223,12 +223,34 @@ REGISTERS = {
     "phase_a_voltage": (5019, "U16", 0.1, "V"),
     "phase_a_current": (5022, "S16", 0.1, "A"),
     "total_active_power": (5031, "U32", None, "W"),
+    # Sits outside the block the other registers fall in, so this widens the single Modbus read
+    # by a few registers rather than costing a second round trip. Decoded into run_state below,
+    # not stored under this name -- see WORK_STATES.
+    "work_state_1": (5038, "U16", None, None),
 }
 # Deliberately absent: installed_pv_power (5016) reads 0 on this unit rather than the array
 # size, so dashboards carry the 6.32 kWp figure as a constant instead. phase_b/c_voltage
 # (5020/5021) and mppt_3 (5015/5016) read 0 too -- this is a single-phase, two-string model.
 # Every register above already falls inside the one block poll_inverter reads, so none of
 # them costs an extra Modbus round trip.
+
+# work_state_1's value mapping, same source as REGISTERS above. Not a bitmask despite the range --
+# each is a distinct sentinel value, not OR-able flags.
+WORK_STATES = {
+    0x0000: "Run",
+    0x8000: "Stop",
+    0x1300: "Key Stop",
+    0x1500: "Emergency Stop",
+    0x1400: "Standby",
+    0x1200: "Initial Standby",
+    0x1600: "Starting",
+    0x9100: "Alarm Run",
+    0x8100: "Derating Run",
+    0x8200: "Dispatch Run",
+    0x5500: "Fault",
+    0x2500: "Communication Fault",
+}
+
 SCAN_START_ADDRESS = min(addr for addr, *_ in REGISTERS.values())
 SCAN_END_ADDRESS = max(addr + (1 if dtype in ("U32", "S32") else 0) for addr, dtype, *_ in REGISTERS.values())
 SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1
@@ -411,9 +433,13 @@ def poll_inverter(client):
         value = decode_register(words, address - SCAN_START_ADDRESS, datatype)
         values[name] = round(value * accuracy, 2) if accuracy else value
 
-    # This inverter family exposes no run/system state register (that block is hybrid-only in
-    # Sungrow's protocol), so derive it from whether it's currently producing.
-    values["run_state"] = "ON" if values["total_active_power"] > 0 else "OFF"
+    # work_state_1 (see WORK_STATES) turned out to be readable on this model too, despite an
+    # earlier assumption that run/system state registers were hybrid-only in Sungrow's protocol --
+    # replaces a synthetic "ON"/"OFF" derived from total_active_power > 0 with the inverter's own
+    # reported state. Unmapped codes are logged verbatim rather than silently dropped, so a new one
+    # shows up instead of just going missing.
+    work_state_raw = values.pop("work_state_1")
+    values["run_state"] = WORK_STATES.get(work_state_raw, f"Unknown (0x{work_state_raw:04X})")
     return values
 
 
