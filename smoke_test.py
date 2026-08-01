@@ -668,6 +668,108 @@ def check_derived_fields(failures):
         print("  derived fields: solar/grid/house computed together; omitted (not zeroed) without DSMR")
 
 
+def check_solar_stale_fallback(failures):
+    """The inverter goes fully offline overnight (Modbus stops responding), which used to mean
+    power_flow stopped updating entirely until the next successful poll. Covers both halves of the
+    fix: _solar_power_for_derived() falling back to 0 once the last poll is too old, and a DSMR
+    'elec' message triggering its own power_flow write so house/grid keep updating regardless.
+    """
+    before = len(failures)
+    orig_latest_values = dict(app.latest_values)
+    orig_latest_poll_monotonic = app.latest_poll_monotonic
+    orig_min_interval = app.DSMR_MIN_INTERVAL
+    app.DSMR_MIN_INTERVAL = 0
+    with app._dsmr_lock:
+        orig_cache = dict(app.dsmr_cache)
+        app.dsmr_cache.clear()
+    orig_last_written = dict(app._dsmr_last_written)
+    orig_last_write_time = dict(app._dsmr_last_write_time)
+    app._dsmr_last_written.clear()
+    app._dsmr_last_write_time.clear()
+    drained = []
+    while True:
+        try:
+            drained.append(app._write_queue.get_nowait())
+        except Empty:
+            break
+
+    try:
+        # Fresh poll -> the real value.
+        with app._state_lock:
+            app.latest_values.clear()
+            app.latest_values["total_active_power"] = 2500.0
+            app.latest_poll_monotonic = time.monotonic()
+        got = app._solar_power_for_derived()
+        if got != 2500.0:
+            failures.append(f"  solar power with a fresh poll: expected 2500.0, got {got!r}")
+
+        # Poll older than SOLAR_STALE_AFTER -> 0, not the stale reading.
+        with app._state_lock:
+            app.latest_poll_monotonic = time.monotonic() - app.SOLAR_STALE_AFTER - 1
+        got = app._solar_power_for_derived()
+        if got != 0.0:
+            failures.append(f"  solar power with a stale poll: expected 0.0, got {got!r}")
+
+        # No poll at all yet (e.g. container just started) -> 0.
+        with app._state_lock:
+            app.latest_values.clear()
+            app.latest_poll_monotonic = None
+        got = app._solar_power_for_derived()
+        if got != 0.0:
+            failures.append(f"  solar power with no poll yet: expected 0.0, got {got!r}")
+
+        # An 'elec' DSMR message should itself queue a power_flow point -- this is what keeps
+        # house/grid updating through the night, independent of the (dead) solar poll loop.
+        elec_payload = {
+            "electricity_currently_delivered": "0.417",
+            "electricity_currently_returned": "0.000",
+        }
+        app._on_mqtt_message(None, None, _StubMessage(app.DSMR_TOPIC_ELEC, elec_payload))
+        queued = []
+        while True:
+            try:
+                queued.append(app._write_queue.get_nowait())
+            except Empty:
+                break
+        derived_item = next((it for it in queued if it[2] == app.DERIVED_TABLE), None)
+        if derived_item is None:
+            failures.append(
+                f"  no power_flow point queued from a DSMR 'elec' message; queued={queued}"
+            )
+        else:
+            derived_values, _ts_ns, _table, derived_source = derived_item
+            if derived_values.get("solar_w") != 0.0:
+                failures.append(
+                    f"  power_flow from DSMR update: expected solar_w=0.0 (no fresh poll), "
+                    f"got {derived_values.get('solar_w')!r}"
+                )
+            if derived_values.get("house_w") != 417.0:
+                failures.append(
+                    f"  power_flow from DSMR update: expected house_w=417.0, "
+                    f"got {derived_values.get('house_w')!r}"
+                )
+            if derived_source != "derived":
+                failures.append(f"  power_flow from DSMR update: expected source 'derived', got {derived_source!r}")
+
+        if len(failures) == before:
+            print("  solar staleness fallback: 0 W once stale, and DSMR updates keep power_flow writing on their own")
+    finally:
+        with app._state_lock:
+            app.latest_values.clear()
+            app.latest_values.update(orig_latest_values)
+            app.latest_poll_monotonic = orig_latest_poll_monotonic
+        app.DSMR_MIN_INTERVAL = orig_min_interval
+        with app._dsmr_lock:
+            app.dsmr_cache.clear()
+            app.dsmr_cache.update(orig_cache)
+        app._dsmr_last_written.clear()
+        app._dsmr_last_written.update(orig_last_written)
+        app._dsmr_last_write_time.clear()
+        app._dsmr_last_write_time.update(orig_last_write_time)
+        for item in drained:
+            app._write_queue.put_nowait(item)
+
+
 def check_pvoutput_metrics(failures):
     """PVOutput metric formulas in app.METRICS, and build_pvoutput_params() degrading to
     inverter-only output when no smart-meter data is cached."""
@@ -756,6 +858,7 @@ def main():
     check_parse_timestamp_ns(failures)
     check_pvoutput_metrics(failures)
     check_derived_fields(failures)
+    check_solar_stale_fallback(failures)
     check_log_level(failures)
 
     signal.alarm(0)
@@ -766,7 +869,7 @@ def main():
         return 1
 
     print("smoke test passed: modbus, mqtt connect, postgres write, postgres read, dsmr parsing, "
-          "plug parsing, timestamps, pvoutput metrics, derived fields, log level")
+          "plug parsing, timestamps, pvoutput metrics, derived fields, solar staleness fallback, log level")
     return 0
 
 

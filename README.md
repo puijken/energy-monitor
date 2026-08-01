@@ -58,6 +58,9 @@ over.
 | `DSMR_GAS_TABLE` | `gas_positions` | Table for gas readings |
 | `DSMR_DAY_TABLE` | `electricity_day_totals` | Table for day totals |
 | `DSMR_MAX_DATA_AGE` | `300` | Cached meter values older than this count as absent |
+| `ENABLE_DERIVED` | `true` | Write `power_flow` (solar/grid/house at one instant), combining the latest cached inverter and DSMR readings whenever either updates |
+| `DERIVED_TABLE` | `power_flow` | Table written to |
+| `SOLAR_STALE_AFTER` | `120` | Seconds after which a stale inverter poll is treated as "not producing" (0 W) rather than reused, for `power_flow` purposes. See [Why power_flow updates from two triggers](#why-power_flow-updates-from-two-triggers). |
 | `ENABLE_PLUGS` | `false` | Subscribe to configured Zigbee2MQTT smart-plug topics for per-circuit submetering. See [Smart plugs](#smart-plugs-zigbee2mqtt). |
 | `PLUG_TOPICS` | *(none)* | Comma-separated `topic=label` pairs, e.g. `zigbee2mqtt/Plug A=server,zigbee2mqtt/Plug B=airco`. The label becomes the `source` column value. |
 | `PLUG_TABLE` | `smart_plugs` | Table written to |
@@ -139,6 +142,27 @@ Why MQTT and not the alternatives:
   DSMR-reader: those endpoints accept a single client and answer `Port already in use`.
 - The database and REST API would both work, but MQTT needs no schema coupling, no extra
   credentials, and no network changes — the broker connection already exists for publishing.
+
+## Why power_flow updates from two triggers
+
+`power_flow` (solar/grid/house at one instant) was originally only written from the inverter poll
+loop, using whatever DSMR reading happened to be cached at that moment. That silently broke every
+night: this inverter goes fully offline overnight (Modbus stops responding entirely, not just
+idling at 0 W), so the poll loop's every attempt raised and nothing got written — not even a "0 W
+solar" point — for as long as the inverter was asleep. The smart meter, meanwhile, keeps reporting
+all night, so `electricity`'s own data never had a gap; only the derived `power_flow` table did,
+and a Grafana chart spanning that gap just drew a straight line across it, which reads as a stuck
+reading rather than a legitimate outage — the actual symptom that first surfaced this.
+
+Fixed by writing `power_flow` from **either** side updating: the existing poll-loop trigger for
+when the inverter is responding, plus a second trigger from every fresh DSMR `elec` message
+(`_handle_dsmr_message` in `app.py`), each using the other side's latest cached value. On the DSMR
+side, the inverter's contribution comes from `_solar_power_for_derived()`: the last poll's value if
+it's within `SOLAR_STALE_AFTER`, otherwise `0.0` — deliberately zeroed rather than omitted, since a
+stale solar poll here reliably means "asleep, not producing", unlike a DSMR outage (genuinely
+unknown, so `derived_fields()` still omits grid/house rather than guessing). During the day, when
+both sides are updating every few seconds, this doubles `power_flow`'s write rate — harmless at
+TimescaleDB's scale, and still just one row per instant either trigger fires.
 
 ## Smart plugs (Zigbee2MQTT)
 

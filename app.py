@@ -150,9 +150,17 @@ PLUG_TOPIC_MAP = parse_plug_topics(PLUG_TOPICS)
 
 # Solar, grid and house power written together as one table, from values held in memory at the
 # same instant -- a live as-of join across independently-polled solar/DSMR readings would be
-# more complex and costly than continuing to compute this once, at ingest.
+# more complex and costly than continuing to compute this once, at ingest. Written on *either*
+# side updating (a fresh solar poll, or a fresh DSMR message), each time using the other side's
+# latest cached value -- the inverter goes fully offline overnight (Modbus stops responding
+# entirely, not just idles at 0), so without this house/grid would flatline right along with it
+# even though the smart meter keeps reporting all night.
 ENABLE_DERIVED = env_bool("ENABLE_DERIVED", True)
 DERIVED_TABLE = env("DERIVED_TABLE", "power_flow")
+# How long a solar poll stays "current" for power_flow purposes. Past this, the inverter is
+# treated as not producing (0 W) rather than reusing an increasingly-stale reading -- comfortably
+# above SCAN_INTERVAL so a single missed poll doesn't trigger it, well below "asleep all night".
+SOLAR_STALE_AFTER = env_int("SOLAR_STALE_AFTER", 120)
 # Minimum spacing between Postgres writes per source. DSMR-reader republishes on every telegram
 # (~6s), which is finer than a dashboard needs; the in-memory cache still updates on every message,
 # so PVOutput and the metrics always see the latest values regardless. 0 disables throttling.
@@ -656,7 +664,22 @@ def _handle_dsmr_message(message, entry):
     if ts_ns is not None:
         _dsmr_last_written[key] = (ts_ns, dict(values))
 
-    queue_write(values, ts_ns if ts_ns is not None else time.time_ns(), table, "dsmr")
+    write_ts_ns = ts_ns if ts_ns is not None else time.time_ns()
+    queue_write(values, write_ts_ns, table, "dsmr")
+
+    # Also refresh power_flow here, not just from the solar poll loop -- the smart meter keeps
+    # reporting all night even when the inverter is asleep and Modbus stops responding entirely,
+    # so this is what keeps house/grid from flatlining along with solar.
+    if key == "elec" and ENABLE_DERIVED:
+        try:
+            queue_write(
+                derived_fields({"total_active_power": _solar_power_for_derived()}, get_dsmr_values()),
+                write_ts_ns,
+                DERIVED_TABLE,
+                "derived",
+            )
+        except Exception:
+            log.exception("Could not compute derived power flow from DSMR update")
 
 
 def _handle_plug_message(message, label):
@@ -754,6 +777,20 @@ def mqtt_watchdog_loop(mqtt_client):
                 MQTT_WARN_AFTER,
             )
             warned = True
+
+
+def _solar_power_for_derived():
+    """The inverter's current output for power_flow purposes: the real value if the last poll is
+    still within SOLAR_STALE_AFTER, otherwise 0. Unlike a DSMR outage (unknown, so omitted), a
+    stale solar poll reliably means "asleep, not producing" -- 0 is the correct value, not a
+    guess.
+    """
+    with _state_lock:
+        age = None if latest_poll_monotonic is None else time.monotonic() - latest_poll_monotonic
+        power = latest_values.get("total_active_power")
+    if power is None or age is None or age > SOLAR_STALE_AFTER:
+        return 0.0
+    return power
 
 
 def derived_fields(values, dsmr_values):
