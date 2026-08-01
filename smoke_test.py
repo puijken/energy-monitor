@@ -17,6 +17,9 @@ runtime. This file now additionally covers, all without a real broker or InfluxD
   - DSMR MQTT message handling: app._on_mqtt_message() against real captured DSMR-reader
     payloads, checking string->float coercion, timestamp-field consumption, throttling and what
     ends up on the write queue.
+  - Smart-plug MQTT message handling: app._on_mqtt_message() against real captured Zigbee2MQTT
+    payloads from both plug models on this network (Aqara lumi.plug.mmeu01, Tuya TS0121), checking
+    that only the common fields are kept, per-model extras are dropped, and throttling works.
   - app.parse_timestamp_ns() across the timestamp shapes DSMR-reader actually emits, plus the
     two "this is not a timestamp" cases that matter (garbage, and a numeric meter reading).
   - The PVOutput metric formulas in app.METRICS, and that build_pvoutput_params() degrades to
@@ -427,6 +430,104 @@ def check_dsmr_mqtt_message(failures):
             app._write_queue.put_nowait(item)
 
 
+def check_plug_mqtt_message(failures):
+    """Smart-plug MQTT message parsing, using real captured Zigbee2MQTT payloads.
+
+    Exercises app._on_mqtt_message() end to end for the plug topic path: only the common
+    power/energy/current/voltage/state fields end up queued for InfluxDB, per-model extras
+    (auto_off, device_temperature, indicator_mode, ...) are dropped, and an unconfigured topic is
+    silently ignored rather than raising or getting queued.
+    """
+    before = len(failures)
+    orig_topic_map = dict(app.PLUG_TOPIC_MAP)
+    orig_min_interval = app.PLUG_MIN_INTERVAL
+    orig_last_write_time = dict(app._plug_last_write_time)
+    orig_seen = set(app._plug_seen)
+    app.PLUG_TOPIC_MAP.clear()
+    app.PLUG_TOPIC_MAP.update({
+        "zigbee2mqtt/Plug A": "server",
+        "zigbee2mqtt/Plug B": "tv",
+    })
+    app.PLUG_MIN_INTERVAL = 0  # disable throttling so both messages definitely get queued
+    app._plug_last_write_time.clear()
+    app._plug_seen.clear()
+    drained = []
+    while True:
+        try:
+            drained.append(app._write_queue.get_nowait())
+        except Empty:
+            break
+
+    # Aqara lumi.plug.mmeu01 (Plug A) -- captured payload.
+    aqara_payload = {
+        "auto_off": False, "consumer_connected": False, "consumption": 534.5677490234375,
+        "current": 0.09, "device_temperature": 30, "energy": 534.57, "led_disabled_night": True,
+        "linkquality": 167, "power": 27.5, "power_outage_count": 41, "power_outage_memory": True,
+        "state": "ON", "voltage": 234,
+    }
+    # Tuya TS0121 (Plug B) -- captured payload.
+    tuya_payload = {
+        "current": 0.46, "energy": 2652.83, "indicator_mode": "off", "linkquality": 32,
+        "power": 94, "power_outage_memory": "off", "state": "ON", "voltage": 234,
+    }
+
+    try:
+        app._on_mqtt_message(None, None, _StubMessage("zigbee2mqtt/Plug A", aqara_payload))
+        app._on_mqtt_message(None, None, _StubMessage("zigbee2mqtt/Plug B", tuya_payload))
+        # An unconfigured topic must be silently ignored, not raise or get queued.
+        app._on_mqtt_message(None, None, _StubMessage("zigbee2mqtt/Badkamer sensor", {"battery": 100}))
+
+        queued = []
+        while True:
+            try:
+                queued.append(app._write_queue.get_nowait())
+            except Empty:
+                break
+
+        expected_server = {"power": 27.5, "energy": 534.57, "current": 0.09, "voltage": 234.0, "state": "ON"}
+        expected_tv = {"power": 94.0, "energy": 2652.83, "current": 0.46, "voltage": 234.0, "state": "ON"}
+
+        server_item = next((it for it in queued if it[3] == "server"), None)
+        tv_item = next((it for it in queued if it[3] == "tv"), None)
+
+        if server_item is None:
+            failures.append(f"  no point enqueued for plug label 'server'; queued={queued}")
+        else:
+            values, _ts_ns, measurement, _source = server_item
+            if values != expected_server:
+                failures.append(f"  queued server-plug point: expected {expected_server}, got {values}")
+            if measurement != app.PLUG_MEASUREMENT:
+                failures.append(
+                    f"  queued server-plug measurement: expected {app.PLUG_MEASUREMENT!r}, got {measurement!r}"
+                )
+
+        if tv_item is None:
+            failures.append(f"  no point enqueued for plug label 'tv'; queued={queued}")
+        else:
+            values, _ts_ns, _measurement, _source = tv_item
+            if values != expected_tv:
+                failures.append(f"  queued tv-plug point: expected {expected_tv}, got {values}")
+
+        if len(queued) != 2:
+            failures.append(
+                f"  expected exactly 2 queued plug points (unconfigured topic ignored), got "
+                f"{len(queued)}: {queued}"
+            )
+
+        if len(failures) == before:
+            print("  plug mqtt parsing: Aqara + Tuya payloads reduced to the common field set and queued as expected")
+    finally:
+        app.PLUG_TOPIC_MAP.clear()
+        app.PLUG_TOPIC_MAP.update(orig_topic_map)
+        app.PLUG_MIN_INTERVAL = orig_min_interval
+        app._plug_last_write_time.clear()
+        app._plug_last_write_time.update(orig_last_write_time)
+        app._plug_seen.clear()
+        app._plug_seen.update(orig_seen)
+        for item in drained:
+            app._write_queue.put_nowait(item)
+
+
 def check_parse_timestamp_ns(failures):
     """app.parse_timestamp_ns() across the shapes DSMR-reader emits, and the two non-timestamp
     cases that matter most: garbage, and a numeric meter reading (so a meter value can never be
@@ -614,6 +715,7 @@ def main():
     check_mqtt_connect(failures)
     check_influxdb_write(failures)
     check_dsmr_mqtt_message(failures)
+    check_plug_mqtt_message(failures)
     check_parse_timestamp_ns(failures)
     check_pvoutput_metrics(failures)
     check_derived_fields(failures)
@@ -626,8 +728,8 @@ def main():
         print("\n".join(failures), file=sys.stderr)
         return 1
 
-    print("smoke test passed: modbus, mqtt connect, influxdb write, dsmr parsing, timestamps, "
-          "pvoutput metrics, derived fields, log level")
+    print("smoke test passed: modbus, mqtt connect, influxdb write, dsmr parsing, plug parsing, "
+          "timestamps, pvoutput metrics, derived fields, log level")
     return 0
 
 

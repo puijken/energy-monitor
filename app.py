@@ -106,6 +106,45 @@ DSMR_MAX_DATA_AGE = env_int("DSMR_MAX_DATA_AGE", 300)
 # collapses ~14k duplicate points a day down to ~275 and makes "last reading before midnight"
 # exact. Falls back to receipt time when absent.
 DSMR_TIME_FIELDS = ("timestamp", "read_at")
+# Zigbee2MQTT smart plugs, same broker as DSMR but an unrelated subsystem: submetering a handful
+# of individual circuits (e.g. "Plug A") rather than the whole house. Unlike DSMR these
+# have no fixed schema across devices -- the two plug models seen on this network (Aqara
+# lumi.plug.mmeu01, Tuya TS0121) each publish extra device-specific fields (auto_off /
+# led_disabled_night / power_outage_count on the Aqara, indicator_mode on the Tuya) alongside a
+# common subset. Only that common subset (PLUG_FIELDS below, plus state) is kept, so a plug being
+# swapped for a different model needs no code change.
+ENABLE_PLUGS = env_bool("ENABLE_PLUGS", False)
+# "topic=label,topic=label", e.g. "zigbee2mqtt/Plug A=server". The label becomes the
+# InfluxDB tag value, so keep it short and stable even if the zigbee2mqtt friendly name changes.
+PLUG_TOPICS = env("PLUG_TOPICS", "")
+PLUG_MEASUREMENT = env("PLUG_MEASUREMENT", "smart_plugs")
+PLUG_FIELDS = ("power", "energy", "current", "voltage")
+# Mirrors DSMR_MIN_INTERVAL: these plugs report on every attribute change, multiple times a
+# minute, finer than a dashboard needs.
+PLUG_MIN_INTERVAL = env_int("PLUG_MIN_INTERVAL", 5)
+
+
+def parse_plug_topics(raw):
+    """'topic=label,topic=label' -> {topic: label}.
+
+    Malformed entries are skipped with a warning rather than raised, so one typo doesn't take
+    down every other configured plug.
+    """
+    topics = {}
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        topic, sep, label = entry.partition("=")
+        topic, label = topic.strip(), label.strip()
+        if not sep or not topic or not label:
+            log.warning("Ignoring malformed PLUG_TOPICS entry %r (expected 'topic=label')", entry)
+            continue
+        topics[topic] = label
+    return topics
+
+
+PLUG_TOPIC_MAP = parse_plug_topics(PLUG_TOPICS)
+
 # Solar, grid and house power written together as one measurement, from values held in memory at
 # the same instant. Grafana then needs no cross-measurement join: InfluxQL has none (it evaluates
 # an expression per measurement, so the other measurement's fields come back null), and while
@@ -282,6 +321,11 @@ dsmr_cache = {}
 _dsmr_last_written = {}
 # Monotonic time of the last InfluxDB write per source, for DSMR_MIN_INTERVAL throttling.
 _dsmr_last_write_time = {}
+
+# Monotonic time of the last InfluxDB write per plug label, for PLUG_MIN_INTERVAL throttling.
+_plug_last_write_time = {}
+# Labels already logged once at INFO on first message, so ongoing traffic doesn't repeat it.
+_plug_seen = set()
 
 # InfluxDB writes for smart-meter data are handed to a worker thread rather than performed inside
 # the MQTT callback. paho dispatches on_message on its network thread, so a blocking HTTP POST there
@@ -510,8 +554,15 @@ def get_dsmr_values():
 
 def _on_mqtt_message(client, userdata, message):
     entry = dsmr_topic_map().get(message.topic)
-    if entry is None:
+    if entry is not None:
+        _handle_dsmr_message(message, entry)
         return
+    plug_label = PLUG_TOPIC_MAP.get(message.topic)
+    if plug_label is not None:
+        _handle_plug_message(message, plug_label)
+
+
+def _handle_dsmr_message(message, entry):
     key, measurement = entry
     try:
         # DSMR-reader publishes every value as a JSON string, so coerce to float here and drop
@@ -560,6 +611,38 @@ def _on_mqtt_message(client, userdata, message):
     queue_write(values, ts_ns if ts_ns is not None else time.time_ns(), measurement, "dsmr")
 
 
+def _handle_plug_message(message, label):
+    try:
+        payload = json.loads(message.payload.decode("utf-8"))
+    except Exception:
+        log.exception("Could not parse plug payload on %s", message.topic)
+        return
+
+    values = {}
+    for field in PLUG_FIELDS:
+        if field not in payload:
+            continue
+        try:
+            values[field] = float(payload[field])
+        except (TypeError, ValueError):
+            log.debug("Ignoring non-numeric plug field %s=%r on %s", field, payload[field], message.topic)
+    if "state" in payload:
+        values["state"] = str(payload["state"])
+    if not values:
+        return
+
+    if label not in _plug_seen:
+        _plug_seen.add(label)
+        log.info("Receiving plug data for %s on %s: %s", label, message.topic, ", ".join(sorted(values)))
+
+    now = time.monotonic()
+    if PLUG_MIN_INTERVAL and now - _plug_last_write_time.get(label, 0.0) < PLUG_MIN_INTERVAL:
+        return
+    _plug_last_write_time[label] = now
+
+    queue_write(values, time.time_ns(), PLUG_MEASUREMENT, label)
+
+
 def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     if reason_code != 0:
         log.warning("MQTT connection refused: %s", reason_code)
@@ -572,6 +655,10 @@ def _on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
         for topic in dsmr_topic_map():
             client.subscribe(topic, qos=1)
         log.info("Subscribed to DSMR topics: %s", ", ".join(dsmr_topic_map()))
+    if ENABLE_PLUGS:
+        for topic in PLUG_TOPIC_MAP:
+            client.subscribe(topic, qos=1)
+        log.info("Subscribed to plug topics: %s", ", ".join(PLUG_TOPIC_MAP))
 
 
 def _on_mqtt_disconnect(client, userdata, flags, reason_code, properties=None):
@@ -772,14 +859,20 @@ def validate_config():
         log.error("ENABLE_MINDERGAS is set but MINDERGAS_API_KEY is missing")
         sys.exit(1)
 
+    if ENABLE_PLUGS and not PLUG_TOPIC_MAP:
+        log.error("ENABLE_PLUGS is set but PLUG_TOPICS has no valid entries")
+        sys.exit(1)
+
 
 def main():
     log.info(
-        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss dsmr=%s pvoutput=%s mindergas=%s",
+        "Starting energy-monitor: inverter=%s:%s scan_interval=%ss dsmr=%s plugs=%s(%d) pvoutput=%s mindergas=%s",
         INVERTER_HOST,
         INVERTER_PORT,
         SCAN_INTERVAL,
         ENABLE_DSMR,
+        ENABLE_PLUGS,
+        len(PLUG_TOPIC_MAP),
         ENABLE_PVOUTPUT,
         ENABLE_MINDERGAS,
     )

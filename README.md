@@ -53,6 +53,10 @@ over.
 | `DSMR_GAS_MEASUREMENT` | `gas_positions` | InfluxDB measurement for gas readings |
 | `DSMR_DAY_MEASUREMENT` | `electricity_day_totals` | InfluxDB measurement for day totals |
 | `DSMR_MAX_DATA_AGE` | `300` | Cached meter values older than this count as absent |
+| `ENABLE_PLUGS` | `false` | Subscribe to configured Zigbee2MQTT smart-plug topics for per-circuit submetering. See [Smart plugs](#smart-plugs-zigbee2mqtt). |
+| `PLUG_TOPICS` | *(none)* | Comma-separated `topic=label` pairs, e.g. `zigbee2mqtt/Plug A=server,zigbee2mqtt/Plug B=airco`. The label becomes the InfluxDB tag value. |
+| `PLUG_MEASUREMENT` | `smart_plugs` | InfluxDB measurement written to |
+| `PLUG_MIN_INTERVAL` | `5` | Minimum seconds between InfluxDB writes per plug |
 | `ENABLE_PVOUTPUT` | `false` | When `false`, logs what would be sent instead of posting |
 | `PVOUTPUT_API_KEY` | *(none)* | Required if `ENABLE_PVOUTPUT=true` |
 | `PVOUTPUT_SYSTEM_ID` | *(none)* | Required if `ENABLE_PVOUTPUT=true` |
@@ -130,6 +134,20 @@ Why MQTT and not the alternatives:
   DSMR-reader: those endpoints accept a single client and answer `Port already in use`.
 - The database and REST API would both work, but MQTT needs no schema coupling, no extra
   credentials, and no network changes — the broker connection already exists for publishing.
+
+## Smart plugs (Zigbee2MQTT)
+
+Optionally submeters individual circuits from metering Zigbee smart plugs published by
+Zigbee2MQTT onto the same broker DSMR uses. Enable with `ENABLE_PLUGS=true` and list the topics
+to subscribe to in `PLUG_TOPICS` as `topic=label` pairs; each label becomes the `source` tag value
+in `PLUG_MEASUREMENT` (default `smart_plugs`).
+
+Unlike DSMR there is no fixed schema to map: different plug models publish different extra
+fields (e.g. an Aqara plug's `device_temperature`/`power_outage_count` vs. a Tuya plug's
+`indicator_mode`). Rather than hand-mapping each model, only the fields common to metering plugs
+in general are kept -- `power` (W), `energy` (kWh), `current` (A), `voltage` (V) and `state`
+(`ON`/`OFF`) -- so swapping a plug for a different model or adding a new one needs only a
+`PLUG_TOPICS` entry, no code change. A topic not listed in `PLUG_TOPICS` is ignored.
 
 ## PVOutput mapping
 
