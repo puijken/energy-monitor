@@ -870,8 +870,19 @@ def pg_writer_loop():
 
 
 def pvoutput_loop():
+    """Fires on PVOUTPUT_INTERVAL-aligned wall-clock boundaries (:00/:05/:10 for the 300s
+    default), not on a timer counted from container start -- otherwise every restart shifts the
+    upload times to a new offset, which is exactly the kind of discontinuity that confused
+    PVOutput's own day-total tracking during the PVOutput cutover. Same reasoning as
+    mindergas_loop's wall-clock polling.
+    """
+    last_bucket = int(time.time() // PVOUTPUT_INTERVAL)
     while True:
-        time.sleep(PVOUTPUT_INTERVAL)
+        time.sleep(1)
+        bucket = int(time.time() // PVOUTPUT_INTERVAL)
+        if bucket == last_bucket:
+            continue
+        last_bucket = bucket
         with _state_lock:
             values = dict(latest_values)
             age = None if latest_poll_monotonic is None else time.monotonic() - latest_poll_monotonic
