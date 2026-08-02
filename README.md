@@ -25,9 +25,11 @@ Mindergas (once daily). Built as a self-maintained replacement for the third-par
   midnight (gated by `ENABLE_MINDERGAS`, default off), reading the value back out of the
   `gas_positions` table this container itself writes.
 
-Both external-upload flags default to `false` so this can run safely alongside an existing
-uploader (e.g. `sungrow_monitor`/DSMR-reader) without double-reporting, until you're ready to cut
-over.
+Both external-upload flags default to `false` in the image, so this can run safely alongside an
+existing uploader (e.g. `sungrow_monitor`/DSMR-reader) without double-reporting until each cutover
+happens. They are cut over independently, and a deployment may enable them separately:
+Mindergas is **on** (`ENABLE_MINDERGAS=true`, once DSMR-reader's own Mindergas export was confirmed
+disabled), PVOutput is still **off** pending `sungrow_monitor` being verified and retired.
 
 ## Environment Variables
 
@@ -249,11 +251,21 @@ full list of valid names and exits rather than uploading something unintended.
 
 ## Mindergas integration
 
-Mirrors what DSMR-reader's own exporter does
+Modelled on DSMR-reader's own exporter
 ([src/dsmr_mindergas/services.py](https://github.com/dsmrreader/dsmr-reader/blob/v6/src/dsmr_mindergas/services.py)):
-picks the last gas reading timestamped in the 3 hours before local midnight (i.e. the previous
-day's final reading) and POSTs `{"date": <that day>, "reading": "<m3>"}` to
+picks the last gas reading timestamped strictly before local midnight (i.e. the previous day's
+final reading) and POSTs `{"date": <that day>, "reading": "<m3>"}` to
 `https://www.mindergas.nl/api/meter_readings` with an `AUTH-TOKEN` header.
+
+One deliberate difference: DSMR-reader constrains that lookup to a fixed window (the 3 hours before
+midnight) and gives up if no reading landed in it. `get_last_gas_reading()` applies **no lower
+bound** — Mindergas wants the day's actual final reading, so a gap in gas ingestion should make the
+upload late-but-correct rather than skip the day entirely. The meter reports only every 5 minutes
+and `delivered` is a monotonic counter, so the most recent reading before midnight is the right
+answer however far back it turns out to be.
+
+The upload fires at `MINDERGAS_HOUR:MINDERGAS_MINUTE` (default 00:05 local), inside the 00:05–01:00
+window Mindergas asks uploaders to use so their server load stays spread out.
 
 Unlike the PVOutput metrics this reads from **Postgres**, not the MQTT cache — it needs the value as
 it stood before midnight, which requires timestamped history rather than the latest value. It reads
