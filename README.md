@@ -27,9 +27,16 @@ Mindergas (once daily). Built as a self-maintained replacement for the third-par
 
 Both external-upload flags default to `false` in the image, so this can run safely alongside an
 existing uploader (e.g. `sungrow_monitor`/DSMR-reader) without double-reporting until each cutover
-happens. They are cut over independently, and a deployment may enable them separately:
-Mindergas is **on** (`ENABLE_MINDERGAS=true`, once DSMR-reader's own Mindergas export was confirmed
-disabled), PVOutput is still **off** pending `sungrow_monitor` being verified and retired.
+happens. They are cut over independently; a deployment may enable **both**: Mindergas
+(`ENABLE_MINDERGAS=true`, once DSMR-reader's own Mindergas export was confirmed disabled) and, as
+of 2026-08-02, PVOutput (`ENABLE_PVOUTPUT=true`, once `sungrow_monitor`'s own `pvoutput` export was
+disabled in its `config.yaml`).
+
+Note when taking PVOutput over from another uploader mid-day: with `PVOUTPUT_CUMULATIVE_FLAG=2`,
+PVOutput derives the day total from deltas between successive `v1` values, so the handoff itself
+looks like a meter reset and it re-anchors the running day total to 0 at that point. Cutover-day
+totals are therefore under-reported; it self-corrects at the next midnight reset. Cut over at night
+if that matters.
 
 ## Environment Variables
 
@@ -71,7 +78,7 @@ disabled), PVOutput is still **off** pending `sungrow_monitor` being verified an
 | `PVOUTPUT_API_KEY` | *(none)* | Required if `ENABLE_PVOUTPUT=true` |
 | `PVOUTPUT_SYSTEM_ID` | *(none)* | Required if `ENABLE_PVOUTPUT=true` |
 | `PVOUTPUT_V1`…`PVOUTPUT_V6` | see [PVOutput mapping](#pvoutput-mapping) | Metric name uploaded as each PVOutput parameter; unset = not uploaded |
-| `PVOUTPUT_INTERVAL` | `300` | Seconds between PVOutput pushes |
+| `PVOUTPUT_INTERVAL` | `300` | Seconds between PVOutput pushes. Pushes fire on wall-clock-aligned boundaries of this interval (:00/:05/:10… at the default), not on a timer counted from container start, so restarts don't shift the upload times. PVOutput's own rate limit is 60 requests/hour (300 with a donation account), so don't go below 60 |
 | `PVOUTPUT_CUMULATIVE_FLAG` | `2` | PVOutput `c1`: `1` = v1 and v3 both lifetime, `2` = only v1 lifetime, `3` = only v3 lifetime; omit for day totals. `2` is carried over from the previous SunGather setup — see the note in `app.py` |
 | `PVOUTPUT_MAX_DATA_AGE` | `600` | Skip the upload if the last successful poll is older than this, rather than re-posting a stale reading under the current timestamp |
 | `ENABLE_MINDERGAS` | `false` | When `false`, logs what would be sent instead of posting |
