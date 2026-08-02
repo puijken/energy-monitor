@@ -490,9 +490,11 @@ def write_postgres(values, ts_ns, table=None, source="sungrow"):
         )
 
 
-def get_last_gas_reading(window_start, window_end):
-    """Last (time, value) of MINDERGAS_GAS_FIELD in MINDERGAS_GAS_TABLE within
-    [window_start, window_end), or None. Opens a short-lived connection rather than sharing the
+def get_last_gas_reading(before):
+    """Last (time, value) of MINDERGAS_GAS_FIELD in MINDERGAS_GAS_TABLE strictly before `before`,
+    or None. No lower bound: Mindergas wants the actual final reading of the day, not merely
+    "a recent-enough one", so this must keep looking back however far it takes rather than
+    giving up past some fixed window. Opens a short-lived connection rather than sharing the
     writer thread's persistent one -- this runs at most once a day, from a different thread."""
     with psycopg.connect(
         host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
@@ -501,8 +503,8 @@ def get_last_gas_reading(window_start, window_end):
         with conn.cursor() as cur:
             cur.execute(
                 f'SELECT time, "{MINDERGAS_GAS_FIELD}" FROM {MINDERGAS_GAS_TABLE} '
-                f"WHERE time >= %s AND time < %s ORDER BY time DESC LIMIT 1",
-                (window_start, window_end),
+                f"WHERE time < %s ORDER BY time DESC LIMIT 1",
+                (before,),
             )
             return cur.fetchone()
 
@@ -564,7 +566,7 @@ def push_pvoutput(values):
 
 def push_mindergas():
     # Mirrors DSMR-reader's own exporter (src/dsmr_mindergas/services.py): take the last gas
-    # reading in the 3 hours before local midnight -- i.e. the previous day's final reading --
+    # reading strictly before local midnight -- i.e. the previous day's actual final reading --
     # and POST {"date": <that day>, "reading": "<m3>"}. The value is read back out of the
     # gas_positions table this container itself writes from DSMR_TOPIC_GAS.
     #
@@ -572,12 +574,11 @@ def push_mindergas():
     # value as the session's local time, so passing naive local time here would be ambiguous.
     now_local = datetime.now().astimezone()
     midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    window_start = midnight - timedelta(hours=3)
 
-    row = get_last_gas_reading(window_start, midnight)
+    row = get_last_gas_reading(midnight)
     if row is None:
         raise AssertionError(
-            f"No gas reading found between {window_start.isoformat()} and {midnight.isoformat()} "
+            f"No gas reading found before {midnight.isoformat()} "
             f"-- is ENABLE_DSMR on and is the gas topic publishing?"
         )
 

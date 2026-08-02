@@ -316,18 +316,19 @@ def check_get_last_gas_reading(failures):
 
     Monkeypatches psycopg.connect() (this function opens its own short-lived connection rather
     than sharing the writer thread's persistent one) to return a fake connection with a canned
-    row, and checks the query references the right table and binds the window as parameters
-    rather than interpolating them into the SQL string.
+    row, and checks the query references the right table, has no lower time bound (Mindergas
+    wants the actual final reading of the day, however far back that turns out to be, not merely
+    "a recent-enough one"), and binds the cutoff as a parameter rather than interpolating it into
+    the SQL string.
     """
     before = len(failures)
     canned_row = (datetime(2026, 7, 31, 23, 50, tzinfo=timezone.utc), 6573.284)
     fake_conn = _FakeConnection(fetch_result=canned_row)
     orig_connect = app.psycopg.connect
     app.psycopg.connect = lambda **kwargs: fake_conn
-    window_start = datetime(2026, 7, 31, 21, 0, tzinfo=timezone.utc)
-    window_end = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+    midnight = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
     try:
-        result = app.get_last_gas_reading(window_start, window_end)
+        result = app.get_last_gas_reading(midnight)
     except Exception as exc:
         failures.append(f"  app.get_last_gas_reading() raised {exc!r}")
         return
@@ -340,10 +341,10 @@ def check_get_last_gas_reading(failures):
     sql, params = fake_conn.cursor_obj.executed[0]
     if app.MINDERGAS_GAS_TABLE not in sql:
         failures.append(f"  get_last_gas_reading() SQL doesn't reference {app.MINDERGAS_GAS_TABLE!r}: {sql!r}")
-    if params != (window_start, window_end):
-        failures.append(
-            f"  get_last_gas_reading() params: expected {(window_start, window_end)!r}, got {params!r}"
-        )
+    if "time >=" in sql or "BETWEEN" in sql.upper():
+        failures.append(f"  get_last_gas_reading() SQL has a lower time bound, but should have none: {sql!r}")
+    if params != (midnight,):
+        failures.append(f"  get_last_gas_reading() params: expected {(midnight,)!r}, got {params!r}")
 
     if len(failures) == before:
         print("  postgres read (get_last_gas_reading): SQL/params/return value as expected")
