@@ -173,11 +173,12 @@ PVOUTPUT_INTERVAL = env_int("PVOUTPUT_INTERVAL", 300)
 # PVOutput's c1 flag: 1 = both v1 and v3 are lifetime energy values, 2 = only v1 is, 3 = only v3
 # is. Omitting it entirely means v1/v3 are treated as day totals.
 #
-# 2 is carried over from the previous SunGather setup (cumulative_flag: 2) rather than derived --
-# note it declares v1 a *lifetime* counter while daily_power_yields actually resets at midnight.
-# That happens to produce the right daily figure (the within-day delta PVOutput computes from a
-# counter starting at 0 each day equals the day's generation), but it is not what the flag means.
-# Worth confirming against pvoutput.org for a day after cutover before trusting it.
+# The default 2 matches what SunGather's own config shipped (cumulative_flag: 2), so the same
+# values keep producing the same PVOutput figures. Be aware it is not literally accurate: it
+# declares v1 a *lifetime* counter while daily_power_yields actually resets at midnight. It
+# happens to give the right daily figure anyway -- the within-day delta PVOutput computes from a
+# counter starting at 0 each day equals that day's generation -- but if you change the v1 mapping,
+# re-derive this flag from the metric's real nature rather than assuming 2 still fits.
 PVOUTPUT_CUMULATIVE_FLAG = env_int("PVOUTPUT_CUMULATIVE_FLAG", 2)
 # Don't upload a reading older than this -- otherwise a stalled Modbus connection would keep
 # re-posting the last known value stamped with the current time.
