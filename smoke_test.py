@@ -483,8 +483,8 @@ def check_plug_mqtt_message(failures):
     orig_seen = set(app._plug_seen)
     app.PLUG_TOPIC_MAP.clear()
     app.PLUG_TOPIC_MAP.update({
-        "zigbee2mqtt/Plug A": "server",
-        "zigbee2mqtt/Plug B": "tv",
+        "zigbee2mqtt/Plug A": "plug-a",
+        "zigbee2mqtt/Plug B": "plug-b",
     })
     app.PLUG_MIN_INTERVAL = 0  # disable throttling so both messages definitely get queued
     app._plug_last_write_time.clear()
@@ -496,14 +496,14 @@ def check_plug_mqtt_message(failures):
         except Empty:
             break
 
-    # Aqara lumi.plug.mmeu01 (Plug A) -- captured payload.
+    # Aqara lumi.plug.mmeu01 -- representative payload.
     aqara_payload = {
         "auto_off": False, "consumer_connected": False, "consumption": 534.5677490234375,
         "current": 0.09, "device_temperature": 30, "energy": 534.57, "led_disabled_night": True,
         "linkquality": 167, "power": 27.5, "power_outage_count": 41, "power_outage_memory": True,
         "state": "ON", "voltage": 234,
     }
-    # Tuya TS0121 (Plug B) -- captured payload.
+    # Tuya TS0121 -- representative payload.
     tuya_payload = {
         "current": 0.46, "energy": 2652.83, "indicator_mode": "off", "linkquality": 32,
         "power": 94, "power_outage_memory": "off", "state": "ON", "voltage": 234,
@@ -522,29 +522,29 @@ def check_plug_mqtt_message(failures):
             except Empty:
                 break
 
-        expected_server = {"power": 27.5, "energy": 534.57, "current": 0.09, "voltage": 234.0, "state": "ON"}
-        expected_tv = {"power": 94.0, "energy": 2652.83, "current": 0.46, "voltage": 234.0, "state": "ON"}
+        expected_a = {"power": 27.5, "energy": 534.57, "current": 0.09, "voltage": 234.0, "state": "ON"}
+        expected_b = {"power": 94.0, "energy": 2652.83, "current": 0.46, "voltage": 234.0, "state": "ON"}
 
-        server_item = next((it for it in queued if it[3] == "server"), None)
-        tv_item = next((it for it in queued if it[3] == "tv"), None)
+        a_item = next((it for it in queued if it[3] == "plug-a"), None)
+        b_item = next((it for it in queued if it[3] == "plug-b"), None)
 
-        if server_item is None:
-            failures.append(f"  no point enqueued for plug label 'server'; queued={queued}")
+        if a_item is None:
+            failures.append(f"  no point enqueued for plug label 'plug-a'; queued={queued}")
         else:
-            values, _ts_ns, table, _source = server_item
-            if values != expected_server:
-                failures.append(f"  queued server-plug point: expected {expected_server}, got {values}")
+            values, _ts_ns, table, _source = a_item
+            if values != expected_a:
+                failures.append(f"  queued plug-a point: expected {expected_a}, got {values}")
             if table != app.PLUG_TABLE:
                 failures.append(
-                    f"  queued server-plug table: expected {app.PLUG_TABLE!r}, got {table!r}"
+                    f"  queued plug-a table: expected {app.PLUG_TABLE!r}, got {table!r}"
                 )
 
-        if tv_item is None:
-            failures.append(f"  no point enqueued for plug label 'tv'; queued={queued}")
+        if b_item is None:
+            failures.append(f"  no point enqueued for plug label 'plug-b'; queued={queued}")
         else:
-            values, _ts_ns, _table, _source = tv_item
-            if values != expected_tv:
-                failures.append(f"  queued tv-plug point: expected {expected_tv}, got {values}")
+            values, _ts_ns, _table, _source = b_item
+            if values != expected_b:
+                failures.append(f"  queued plug-b point: expected {expected_b}, got {values}")
 
         if len(queued) != 2:
             failures.append(

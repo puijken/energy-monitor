@@ -110,14 +110,14 @@ DSMR_MAX_DATA_AGE = env_int("DSMR_MAX_DATA_AGE", 300)
 # exact. Falls back to receipt time when absent.
 DSMR_TIME_FIELDS = ("timestamp", "read_at")
 # Zigbee2MQTT smart plugs, same broker as DSMR but an unrelated subsystem: submetering a handful
-# of individual circuits (e.g. "Plug A") rather than the whole house. Unlike DSMR these
-# have no fixed schema across devices -- the two plug models seen on this network (Aqara
+# of individual circuits rather than the whole house. Unlike DSMR these have no fixed schema
+# across devices -- two common plug models (Aqara
 # lumi.plug.mmeu01, Tuya TS0121) each publish extra device-specific fields (auto_off /
 # led_disabled_night / power_outage_count on the Aqara, indicator_mode on the Tuya) alongside a
 # common subset. Only that common subset (PLUG_FIELDS below, plus state) is kept, so a plug being
 # swapped for a different model needs no code change.
 ENABLE_PLUGS = env_bool("ENABLE_PLUGS", False)
-# "topic=label,topic=label", e.g. "zigbee2mqtt/Plug A=server". The label becomes the
+# "topic=label,topic=label", e.g. "zigbee2mqtt/Fridge plug=fridge". The label becomes the
 # `source` column value, so keep it short and stable even if the zigbee2mqtt friendly name changes.
 PLUG_TOPICS = env("PLUG_TOPICS", "")
 PLUG_TABLE = env("PLUG_TABLE", "smart_plugs")
@@ -255,12 +255,12 @@ SCAN_START_ADDRESS = min(addr for addr, *_ in REGISTERS.values())
 SCAN_END_ADDRESS = max(addr + (1 if dtype in ("U32", "S32") else 0) for addr, dtype, *_ in REGISTERS.values())
 SCAN_COUNT = SCAN_END_ADDRESS - SCAN_START_ADDRESS + 1
 
-# Fixed columns per table, matching the Postgres schema in the deploying stack's
-# timescaledb/init/001_hypertables.sql. A field not listed here for its table lands in that
+# Fixed columns per table, matching the Postgres schema the deploying stack creates
+# (see its timescaledb init SQL). A field not listed here for its table lands in that
 # table's `extra` JSONB column instead of failing the insert -- this is what keeps DSMR/plug
-# ingestion schemaless from this module's perspective (enabling a new DSMR field per
-# that DSMR-reader publishes needs no code change here, only a schema/dashboard change
-# once it's actually wanted).
+# ingestion schemaless from this module's perspective (enabling a new DSMR field that
+# DSMR-reader publishes needs no code change here, only a schema/dashboard change once it's
+# actually wanted).
 TABLE_COLUMNS = {
     POSTGRES_TABLE: set(REGISTERS) | {"run_state"},
     DSMR_ELEC_TABLE: {

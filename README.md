@@ -26,11 +26,9 @@ Mindergas (once daily). Built as a self-maintained replacement for the third-par
   `gas_positions` table this container itself writes.
 
 Both external-upload flags default to `false` in the image, so this can run safely alongside an
-existing uploader (e.g. `sungrow_monitor`/DSMR-reader) without double-reporting until each cutover
-happens. They are cut over independently; a deployment may enable **both**: Mindergas
-(`ENABLE_MINDERGAS=true`, once DSMR-reader's own Mindergas export was confirmed disabled) and, as
-of 2026-08-02, PVOutput (`ENABLE_PVOUTPUT=true`, once `sungrow_monitor`'s own `pvoutput` export was
-disabled in its `config.yaml`).
+existing uploader (SunGather, DSMR-reader's own exporters) without double-reporting. Each upload
+should be owned by exactly one uploader, so disable the old one at its source before enabling the
+matching flag here; the two are independent and can be cut over separately.
 
 Note when taking PVOutput over from another uploader mid-day: with `PVOUTPUT_CUMULATIVE_FLAG=2`,
 PVOutput derives the day total from deltas between successive `v1` values, so the handoff itself
@@ -71,7 +69,7 @@ if that matters.
 | `DERIVED_TABLE` | `power_flow` | Table written to |
 | `SOLAR_STALE_AFTER` | `120` | Seconds after which a stale inverter poll is treated as "not producing" (0 W) rather than reused, for `power_flow` purposes. See [Why power_flow updates from two triggers](#why-power_flow-updates-from-two-triggers). |
 | `ENABLE_PLUGS` | `false` | Subscribe to configured Zigbee2MQTT smart-plug topics for per-circuit submetering. See [Smart plugs](#smart-plugs-zigbee2mqtt). |
-| `PLUG_TOPICS` | *(none)* | Comma-separated `topic=label` pairs, e.g. `zigbee2mqtt/Plug A=server,zigbee2mqtt/Plug B=airco`. The label becomes the `source` column value. |
+| `PLUG_TOPICS` | *(none)* | Comma-separated `topic=label` pairs, e.g. `zigbee2mqtt/Fridge plug=fridge,zigbee2mqtt/Office plug=office`. The label becomes the `source` column value. |
 | `PLUG_TABLE` | `smart_plugs` | Table written to |
 | `PLUG_MIN_INTERVAL` | `5` | Minimum seconds between Postgres writes per plug |
 | `ENABLE_PVOUTPUT` | `false` | When `false`, logs what would be sent instead of posting |
@@ -306,6 +304,5 @@ the published image.
 
 ## Docker Compose
 
-See `docker-compose.yml` in this repo for a usage example. A typical deployment has this
-container is one service alongside the TimescaleDB instance it writes to,
-alongside the TimescaleDB and Grafana instances it feeds.
+See `docker-compose.yml` in this repo for a usage example. It is meant to sit alongside the
+TimescaleDB instance it writes to and whatever Grafana (or other client) reads that database.
