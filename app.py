@@ -171,15 +171,17 @@ PVOUTPUT_API_KEY = env("PVOUTPUT_API_KEY")
 PVOUTPUT_SYSTEM_ID = env("PVOUTPUT_SYSTEM_ID")
 PVOUTPUT_INTERVAL = env_int("PVOUTPUT_INTERVAL", 300)
 # PVOutput's c1 flag: 1 = both v1 and v3 are lifetime energy values, 2 = only v1 is, 3 = only v3
-# is. Omitting it entirely means v1/v3 are treated as day totals.
+# is. Omitting it (or 0) means v1/v3 are taken as-is, i.e. day totals.
 #
-# The default 2 matches what SunGather's own config shipped (cumulative_flag: 2), so the same
-# values keep producing the same PVOutput figures. Be aware it is not literally accurate: it
-# declares v1 a *lifetime* counter while daily_power_yields actually resets at midnight. It
-# happens to give the right daily figure anyway -- the within-day delta PVOutput computes from a
-# counter starting at 0 each day equals that day's generation -- but if you change the v1 mapping,
-# re-derive this flag from the metric's real nature rather than assuming 2 still fits.
-PVOUTPUT_CUMULATIVE_FLAG = env_int("PVOUTPUT_CUMULATIVE_FLAG", 2)
+# Default 0: the default v1 mapping (daily_generation_wh) is a day total that resets to 0 at
+# midnight, not a true lifetime counter, so c1 must stay unset for it. The old SunGather config
+# shipped cumulative_flag: 2 for this same mapping, which looks like it should still work -- the
+# within-day delta from a counter starting at 0 each day equals that day's generation -- but
+# PVOutput's own baseline tracking for c1 is documented as unreliable for values that reset daily
+# (https://forum.pvoutput.org/t/c1-1-first-positive-value-is-subtracted-from-all-subsequent-values/8930),
+# and it left Energy Generation stuck at 0 in production despite Power/Voltage reporting fine. If
+# you remap v1/v3 to a genuine lifetime metric (e.g. total_generation_wh), set this to match.
+PVOUTPUT_CUMULATIVE_FLAG = env_int("PVOUTPUT_CUMULATIVE_FLAG", 0)
 # Don't upload a reading older than this -- otherwise a stalled Modbus connection would keep
 # re-posting the last known value stamped with the current time.
 PVOUTPUT_MAX_DATA_AGE = env_int("PVOUTPUT_MAX_DATA_AGE", 600)

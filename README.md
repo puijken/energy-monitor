@@ -30,11 +30,14 @@ existing uploader (SunGather, DSMR-reader's own exporters) without double-report
 should be owned by exactly one uploader, so disable the old one at its source before enabling the
 matching flag here; the two are independent and can be cut over separately.
 
-Note when taking PVOutput over from another uploader mid-day: with `PVOUTPUT_CUMULATIVE_FLAG=2`,
-PVOutput derives the day total from deltas between successive `v1` values, so the handoff itself
-looks like a meter reset and it re-anchors the running day total to 0 at that point. Cutover-day
-totals are therefore under-reported; it self-corrects at the next midnight reset. Cut over at night
-if that matters.
+`PVOUTPUT_CUMULATIVE_FLAG` (PVOutput's `c1`) defaults to `0` because the default `v1` mapping
+(`daily_generation_wh`) is a day total that resets to 0 at midnight, not a true lifetime counter.
+Setting it to `1`/`2` for a day-total metric is a real production issue, not just theoretical: it
+tells PVOutput to compute Energy Generation as a delta from a baseline it tracks unreliably across
+midnight resets, which can leave Energy Generation stuck at 0 all day on PVOutput's site while
+Power/Voltage keep reporting fine (see the
+[forum thread](https://forum.pvoutput.org/t/c1-1-first-positive-value-is-subtracted-from-all-subsequent-values/8930)).
+Only set this flag if you remap `v1`/`v3` to a genuine lifetime metric such as `total_generation_wh`.
 
 ## Environment Variables
 
@@ -77,7 +80,7 @@ if that matters.
 | `PVOUTPUT_SYSTEM_ID` | *(none)* | Required if `ENABLE_PVOUTPUT=true` |
 | `PVOUTPUT_V1`…`PVOUTPUT_V6` | see [PVOutput mapping](#pvoutput-mapping) | Metric name uploaded as each PVOutput parameter; unset = not uploaded |
 | `PVOUTPUT_INTERVAL` | `300` | Seconds between PVOutput pushes. Pushes fire on wall-clock-aligned boundaries of this interval (:00/:05/:10… at the default), not on a timer counted from container start, so restarts don't shift the upload times. PVOutput's own rate limit is 60 requests/hour (300 with a donation account), so don't go below 60 |
-| `PVOUTPUT_CUMULATIVE_FLAG` | `2` | PVOutput `c1`: `1` = v1 and v3 both lifetime, `2` = only v1 lifetime, `3` = only v3 lifetime; omit for day totals. `2` is carried over from the previous SunGather setup — see the note in `app.py` |
+| `PVOUTPUT_CUMULATIVE_FLAG` | `0` | PVOutput `c1`: `0` (day totals, matches the default `v1` mapping), `1` = v1 and v3 both lifetime, `2` = only v1 lifetime, `3` = only v3 lifetime. Only set to `1`/`2`/`3` if `v1`/`v3` are remapped to a genuine lifetime metric — see the note in `app.py` |
 | `PVOUTPUT_MAX_DATA_AGE` | `600` | Skip the upload if the last successful poll is older than this, rather than re-posting a stale reading under the current timestamp |
 | `ENABLE_MINDERGAS` | `false` | When `false`, logs what would be sent instead of posting |
 | `MINDERGAS_API_KEY` | *(none)* | Required if `ENABLE_MINDERGAS=true` |
