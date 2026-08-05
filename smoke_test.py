@@ -81,6 +81,8 @@ RAW = {
     5030: 2888,     # total_active_power   U32 low
     5031: 0,        #                      U32 high -> 2888 W
     5037: 0x0000,   # work_state_1         U16 -> 0x0000 "Run"
+    5143: 471,      # fine total yield     U32 low  (FINE_TOTAL_YIELD_REGISTER, polled separately
+    5144: 4,        #                      U32 high  from the block above) -> 26261.5 kWh x0.1
 }
 EXPECTED = {
     "daily_power_yields": 8.3,
@@ -97,6 +99,7 @@ EXPECTED = {
     "phase_a_current": 12.2,
     "total_active_power": 2888,
     "run_state": "Run",
+    "total_power_yields_precise": 26261.5,
 }
 
 
@@ -170,6 +173,15 @@ def check_modbus_poll(failures):
     ac_from_vi = values["phase_a_voltage"] * values["phase_a_current"]
     if abs(ac_from_vi - ac) / ac > 0.05:
         failures.append(f"  phase A V*I {ac_from_vi:.0f}W disagrees with active power {ac}W by >5%")
+
+    # FINE_TOTAL_YIELD_REGISTER is a separate round trip against the same lifetime counter as
+    # total_power_yields, just 0.1 kWh-scaled -- the two must agree to within the coarse register's
+    # own 1 kWh rounding, or a word-order/scale slip on the new register would silently ship.
+    coarse, fine = values["total_power_yields"], values.get("total_power_yields_precise")
+    if fine is None:
+        failures.append("  total_power_yields_precise missing (fine-yield register read failed)")
+    elif abs(fine - coarse) > 1:
+        failures.append(f"  fine total yield {fine}kWh disagrees with coarse {coarse}kWh by >1kWh")
 
     print(f"  modbus poll: {len(EXPECTED)} values decoded, unit kwarg={app._UNIT_KWARG!r}")
 

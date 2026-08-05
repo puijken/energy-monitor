@@ -209,9 +209,11 @@ MINDERGAS_GAS_FIELD = env("MINDERGAS_GAS_FIELD", "delivered")
 # hence the -1 in poll_inverter. All of these live in the input-register space (function code 4).
 REGISTERS = {
     "daily_power_yields": (5003, "U16", 0.1, "kWh"),
-    # Whole kWh: register 5004 carries no scaling factor (unlike the 0.1-scaled variant at 5144,
-    # which sits outside this scan block). Verified against the inverter -- 26261 kWh over
-    # total_running_time 18169 h is 1.45 kW average while generating, right for a 5 kWp array.
+    # Whole kWh: register 5004 carries no scaling factor. Verified against the inverter -- 26261
+    # kWh over total_running_time 18169 h is 1.45 kW average while generating, right for a 5 kWp
+    # array. The 0.1-scaled twin at 5144 (FINE_TOTAL_YIELD_REGISTER below) sits far enough outside
+    # this block that including it here would push a single Modbus read past the 125-register
+    # protocol limit, so it's polled separately instead -- see poll_inverter.
     "total_power_yields": (5004, "U32", None, "kWh"),
     "total_running_time": (5006, "U32", None, "h"),
     "internal_temperature": (5008, "S16", 0.1, "C"),
@@ -236,6 +238,19 @@ REGISTERS = {
 # (5020/5021) and mppt_3 (5015/5016) read 0 too -- this is a single-phase, two-string model.
 # Every register above already falls inside the one block poll_inverter reads, so none of
 # them costs an extra Modbus round trip.
+
+# 0.1 kWh-scaled twin of total_power_yields (register 5004), confirmed live against the inverter
+# (26450.8 kWh here vs 26450 unscaled). Read as its own small Modbus block rather than folded into
+# REGISTERS/the main scan: 5144 sits far enough past the 5003-5038 block that including it would
+# push SCAN_COUNT to 143 registers, over the 125-register limit a single Modbus read PDU allows.
+#
+# Exists to fix a real problem: dashboard panels that compute a single day's (or the live "so
+# far today") generation as max(total_power_yields) - min(total_power_yields) over that period
+# inherit total_power_yields' whole-kWh quantization, which shows up as visible 1 kWh jumps when
+# the day's total is still small (see dashboard_energy's README). This field isn't in REGISTERS,
+# so it isn't a fixed column on the `solar` table -- it lands in `extra` (see TABLE_COLUMNS/
+# write_postgres) until it's worth promoting to one.
+FINE_TOTAL_YIELD_REGISTER = (5144, "U32", 0.1, "kWh")
 
 # work_state_1's value mapping, same source as REGISTERS above. Not a bitmask despite the range --
 # each is a distinct sentinel value, not OR-able flags.
@@ -443,6 +458,23 @@ def poll_inverter(client):
     # shows up instead of just going missing.
     work_state_raw = values.pop("work_state_1")
     values["run_state"] = WORK_STATES.get(work_state_raw, f"Unknown (0x{work_state_raw:04X})")
+
+    # Separate round trip for FINE_TOTAL_YIELD_REGISTER (see its comment) -- optional, so a failure
+    # here (a firmware without this register, a mid-poll hiccup) drops only this one field into a
+    # log line rather than raising and losing the whole poll, which the main block above is not
+    # allowed to do.
+    try:
+        fine_address, fine_datatype, fine_accuracy, _fine_unit = FINE_TOTAL_YIELD_REGISTER
+        fine_result = client.read_input_registers(
+            fine_address - 1, count=2, **{_UNIT_KWARG: INVERTER_SLAVE_ID}
+        )
+        if fine_result.isError():
+            raise OSError(f"Modbus read failed: {fine_result}")
+        fine_value = decode_register(fine_result.registers, 0, fine_datatype)
+        values["total_power_yields_precise"] = round(fine_value * fine_accuracy, 2)
+    except Exception:
+        log.warning("Could not read fine-grained total yield register (5144)", exc_info=True)
+
     return values
 
 
